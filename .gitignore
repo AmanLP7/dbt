@@ -1,0 +1,10 @@
+# Virtual environment
+.venv/
+venv/
+
+# dbt logs and compiled target files
+logs/
+target/
+
+# Personal learning readme (gitignored)
+dbt_readme.md
