@@ -1,0 +1,72 @@
+version: 2
+
+models:
+  - name: stg_reddit_posts
+    description: "Cleaned and deduplicated posts from r/worldnews"
+    columns:
+      - name: post_id
+        description: "The unique identifier of the post"
+        tests:
+          - unique
+          - not_null
+      - name: author_username
+        description: "The Reddit username of the poster"
+        tests:
+          - not_null
+          # The users feed is fetched independently of the posts feed, so a poster
+          # can legitimately be absent from r_users. Warn rather than fail so the
+          # gap stays visible without blocking the build.
+          - relationships:
+              arguments:
+                to: ref('stg_reddit_users')
+                field: author_username
+              config:
+                severity: warn
+
+  - name: stg_reddit_comments
+    description: "Cleaned and deduplicated comments from r/worldnews posts"
+    columns:
+      - name: comment_id
+        description: "The unique identifier of the comment"
+        tests:
+          - unique
+          - not_null
+      - name: post_id
+        description: "Foreign key referencing the parent post"
+        tests:
+          - not_null
+          # Referential integrity is not guaranteed by the ingestion window: a
+          # comment can be loaded for a post that is absent from r_worldnews (the
+          # post aged out or was not re-fetched while its comments were). Warn
+          # rather than fail so the gap stays visible.
+          - relationships:
+              arguments:
+                to: ref('stg_reddit_posts')
+                field: post_id
+              config:
+                severity: warn
+      - name: author_username
+        description: "The Reddit username of the commenter"
+        tests:
+          - not_null
+          # A commenter can be missing from r_users for the same reason as above.
+          - relationships:
+              arguments:
+                to: ref('stg_reddit_users')
+                field: author_username
+              config:
+                severity: warn
+
+  - name: stg_reddit_users
+    description: "Cleaned and deduplicated user profiles of posters and commenters"
+    columns:
+      - name: user_id
+        description: "The unique identifier of the user"
+        tests:
+          - unique
+          - not_null
+      - name: author_username
+        description: "The Reddit username"
+        tests:
+          - unique
+          - not_null

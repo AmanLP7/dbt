@@ -1,0 +1,14 @@
+{
+  "wsl-sound-alert": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v powershell.exe >/dev/null && powershell.exe -c \"(New-Object Media.SoundPlayer 'C:\\Windows\\Media\\notify.wav').PlaySync()\" || true"
+          }
+        ]
+      }
+    ]
+  }
+}

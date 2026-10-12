@@ -1,4 +1,16 @@
-
 target/
 dbt_packages/
 logs/
+
+# Local secrets (Reddit API + Databricks PAT)
+.env
+
+# Python / lint tooling caches
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+
+# dbt writes an anonymous run id as .user.yml wherever it is invoked (repo root
+# for `dbt parse`, the profiles dir for the flow), so ignore it at any level.
+.user.yml

@@ -1,0 +1,28 @@
+# Runtime dependencies for the Reddit pipeline.
+#   pip install -r requirements.txt
+# Dev/lint tooling is separate: requirements-dev.txt
+
+# Pipeline orchestration. Verified installed here: a flow with two tasks runs
+# end to end against Prefect's ephemeral server — no `prefect server start`
+# and no Prefect Cloud account required.
+prefect==3.8.8
+
+# Required by the extraction scripts, which run where Reddit and Databricks are
+# reachable. Pinned so CI and the warehouse runs resolve identical versions; bump
+# them together with a green CI run. Install with
+# `pip install -r requirements.txt` into the active environment, not as a `uv
+# tool`, or the installed console scripts can shadow the environment's python.
+#   praw                      -> import praw
+#   databricks-sql-connector  -> import databricks.sql
+#   databricks-sdk            -> import databricks.sdk  (profile credentials)
+#   python-dotenv             -> import dotenv  (already present as a Prefect dep)
+praw==8.0.3
+databricks-sql-connector==4.4.0
+databricks-sdk==0.117.0
+python-dotenv==1.2.4
+
+# Runs the `dbt build` mart step that ends the flow: provides the `dbt` console
+# script and the Databricks adapter. Pinned to the version the models were
+# verified against. Model linting (sqlfluff) lints the same SQL with no warehouse
+# and stays in requirements-dev.txt.
+dbt-databricks==1.12.6

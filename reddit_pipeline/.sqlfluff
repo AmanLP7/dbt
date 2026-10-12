@@ -1,0 +1,46 @@
+[sqlfluff]
+# Databricks SQL is the warehouse behind this project (dbt-databricks).
+dialect = databricks
+# Jinja, not dbt: linting must not require a warehouse connection or profile.
+templater = jinja
+# Ignore anything under the paths in .sqlfluffignore.
+ignore_paths = target, dbt_packages, logs
+# Model files with long CTE lists are still small; keep linting them fully.
+large_file_skip_byte_limit = 0
+# Warn only on rules not in the core set so new SQL can land incrementally.
+max_line_length = 120
+
+[sqlfluff:templater:jinja]
+# Resolve {{ ref() }}, {{ source() }}, {{ config() }} and {{ var() }} as stubs
+# rather than failing on undefined variables.
+apply_dbt_builtins = True
+# Resolve project macros (e.g. {{ add_audit_fields() }}) the same way dbt does.
+load_macros_from_path = macros
+
+[sqlfluff:rules:capitalisation.keywords]
+# Existing models use lower-case keywords consistently.
+capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.identifiers]
+# Existing models use lower_snake unquoted identifiers.
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.functions]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.literals]
+capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.types]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:aliasing.table]
+# Existing models alias tables implicitly (`from posts p`) throughout.
+aliasing = implicit
+
+[sqlfluff:rules:references.keywords]
+# `source`, `users` and `title` are not reserved in the Databricks dialect and
+# are used here as a CTE name and as column names taken straight from the raw
+# Reddit tables, so keep the rule off for these three words only.
+ignore_words = source,users,title
+unquoted_identifiers_policy = all

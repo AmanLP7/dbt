@@ -1,0 +1,36 @@
+---
+# Prefect project config for the reddit pipeline.
+#
+# Register the deployment on the connected server with (from the repo root):
+#
+#   prefect deploy -n reddit-extract
+#
+# `reddit-extract` runs the three extractors and then calls the `dbt-build` flow
+# as a subflow, so this one deployment covers the whole pipeline. There is no
+# schedule: trigger it by hand (`prefect deployment run reddit-extract/reddit-extract`)
+# or from the dashboard. The `directory` in the pull step is the checkout this
+# machine runs from, matching what `prefect deploy init` generates.
+name: reddit-pipeline
+prefect-version: 3.8.8
+
+build: null
+push: null
+
+pull:
+- prefect.deployments.steps.set_working_directory:
+    directory: /home/aman_lp7/GitHub/dbt/reddit_pipeline
+
+deployments:
+- name: reddit-extract
+  description: >-
+    Reddit ingestion: fetch the hot posts, their comments and authors into the
+    raw Delta tables, then run the dbt build (`dbt-build` runs as a nested flow
+    run). Requires `.env` and a Databricks CLI login on this machine.
+  entrypoint: flows/reddit_extract_flow.py:reddit_extract_flow
+  tags: []
+  parameters: {}
+  schedule: {}
+  work_pool:
+    name: reddit-pool
+    work_queue_name: null
+    job_variables: {}

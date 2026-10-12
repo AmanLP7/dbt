@@ -1,0 +1,26 @@
+# dbt profile for this repo, used by the flow via `--profiles-dir profiles`.
+#
+# It authenticates with a token that the flow derives from the same Databricks CLI
+# profile the extractors use (`databricks auth login`), so one login covers both
+# ingestion and the mart build. Host and http path come from .env — the same
+# values the extractors connect with — so the two halves of the pipeline cannot
+# disagree about which workspace they write to.
+#
+# The profile lives here rather than in ~/.dbt so the repo carries its own
+# authentication story. Invoking `dbt` by hand still resolves ~/.dbt/profiles.yml
+# unless you point it here:
+#
+#   DBT_PROFILES_DIR=profiles dbt build
+#
+# (manual runs need DATABRICKS_TOKEN set; the flow sets it from the CLI profile).
+reddit_pipeline:
+  target: dev
+  outputs:
+    dev:
+      type: databricks
+      catalog: workspace
+      schema: reddit
+      host: "{{ env_var('DATABRICKS_HOSTNAME') }}"
+      http_path: "{{ env_var('DATABRICKS_HTTP_PATH') }}"
+      token: "{{ env_var('DATABRICKS_TOKEN') }}"
+      threads: 4

@@ -1,0 +1,67 @@
+version: 2
+
+models:
+  - name: mart_user_metrics
+    description: "Aggregated user engagement metrics including posts, comments, and scores"
+    columns:
+      - name: user_id
+        description: "The unique identifier of the user"
+        tests:
+          - unique
+          - not_null
+      - name: author_username
+        description: "The Reddit username"
+        tests:
+          - unique
+          - not_null
+      - name: rec_updated_at
+        description: "Audit timestamp stamped by add_audit_fields()"
+        tests:
+          - not_null
+
+  - name: mart_post_summary
+    description: "Enriched post-level analytics and local comment aggregates"
+    columns:
+      - name: post_id
+        description: "The unique identifier of the post"
+        tests:
+          - unique
+          - not_null
+      - name: rec_updated_at
+        description: "Audit timestamp stamped by add_audit_fields()"
+        tests:
+          - not_null
+
+  - name: mart_comment_history
+    description: >
+      Comment-grain history combining r_comments with its r_worldnews post context.
+      Incremental merge on comment_id, restricted to the last 5 hours to mirror the
+      ingestion rolling window.
+    columns:
+      - name: comment_id
+        description: "The unique identifier of the comment (grain of this model)"
+        tests:
+          - unique
+          - not_null
+      - name: post_id
+        description: "The id of the r_worldnews post the comment belongs to"
+        tests:
+          - not_null
+          # Referential integrity is not guaranteed by the ingestion window: a
+          # comment can be loaded for a post that is absent from r_worldnews
+          # (the post aged out or was not re-fetched while its comments were).
+          # Warn rather than fail so the gap stays visible.
+          - relationships:
+              arguments:
+                to: ref('stg_reddit_posts')
+                field: post_id
+              config:
+                severity: warn
+      - name: comment_created_at
+        description: "Comment creation time; drives the 5-hour incremental window"
+        tests:
+          - not_null
+      - name: rec_updated_at
+        description: "Audit timestamp stamped by add_audit_fields()"
+        tests:
+          - not_null

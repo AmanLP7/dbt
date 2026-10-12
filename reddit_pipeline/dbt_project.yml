@@ -13,6 +13,9 @@ profile: 'reddit_pipeline'
 # found in the "models/" directory. You probably won't need to change these!
 model-paths: ["models"]
 analysis-paths: ["analyses"]
+# dbt collects only `.sql` files from test-paths, so the pytest suite in `tests/`
+# (test_*.py, conftest.py, fakes.py) is invisible to it and the two share the
+# directory without interfering.
 test-paths: ["tests"]
 seed-paths: ["seeds"]
 macro-paths: ["macros"]
@@ -22,15 +25,19 @@ clean-targets:         # directories to be removed by `dbt clean`
   - "target"
   - "dbt_packages"
 
-
 # Configuring models
 # Full documentation: https://docs.getdbt.com/docs/configuring-models
 
-# In this example config, we tell dbt to build all models in the example/
-# directory as views. These settings can be overridden in the individual model
-# files using the `{{ config(...) }}` macro.
+# Materialisation is configured per layer, keyed by the directory under models/.
+# The layer directories are inherited by their subdirectories, so the source
+# subfolders (models/staging/reddit/, models/intermediate/reddit/,
+# models/marts/reddit/) pick up their layer's materialisation unchanged. An
+# individual model can still override it with its own {{ config(...) }} block.
 models:
   reddit_pipeline:
-    # Config indicated by + and applies to all files under models/example/
-    example:
+    staging:
       +materialized: view
+    intermediate:
+      +materialized: view
+    marts:
+      +materialized: table
