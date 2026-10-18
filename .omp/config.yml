@@ -1,0 +1,58 @@
+# OMP settings for this repo checkout. OMP reads only the `.omp/` of its current
+# working directory (it does not walk ancestors), so each project holds symlinks
+# to the files here:
+#
+#   job_postings/.omp/{mcp.json,config.yml,RULES.md}    -> ../../.omp/...
+#   reddit_pipeline/.omp/{mcp.json,config.yml,RULES.md} -> ../../.omp/...
+#   wikimedia/.omp/{mcp.json,config.yml,RULES.md}       -> ../../.omp/...
+#
+# RULES.md needs its own link even though it is not a settings file: native
+# sticky-rule discovery stops at the nearest non-empty `.omp/`, so from inside a
+# project directory the root `.omp/RULES.md` alone would not load. A new
+# subproject that gains a non-empty `.omp/` needs all three links, or the rule
+# silently disappears there. A directory with no `.omp/` gets neither the rules
+# nor the MCP server — OMP does not walk ancestors — so `wikimedia/` carries
+# the same three links rather than inheriting them.
+#
+# Keep the definitions at the checkout root; edit them once and all three
+# projects pick the change up.
+#
+# One governed read-only Databricks SQL MCP service (Unity Gateway):
+#
+#   databricks  workspace.reddit.dbsql_read_only
+#               execute_sql_read_only, poll_sql_result
+#               runs as service principal `omp-dbsql-ro`
+#
+# Its service principal holds USE_CATALOG on workspace plus USE_SCHEMA and
+# SELECT ON SCHEMA for all four schemas (job_postings, reddit, topic_raw,
+# wikimedia), granted 2026-10-18, so `job_postings` is queried through this
+# server too and dbt-created relations stay readable without re-granting. With a
+# single server there is no schema routing to enforce; narrow the grants if the
+# boundary matters.
+#
+# It is called with the caller's own Databricks identity resolved per request
+# by `databricks auth token`, so callers still need EXECUTE on the MCP and
+# USE CATALOG/USE SCHEMA on its parents. The data access is the connection's
+# service principal, not the caller.
+#
+# Writes are impossible at three independent layers, none of which live in an
+# MCP client's config:
+#   1. the service's `config.include_tool_selectors` omits any write tool, so
+#      `execute_sql` is absent from tools/list and a call to it returns
+#      "Tool not allowed by MCP service configuration";
+#   2. `execute_sql_read_only` runs in a genuine read-only DBSQL session, so a
+#      persistent write fails with [OP_NOT_SUPPORTED_READ_ONLY]. Session-local
+#      `CREATE TEMPORARY VIEW` is accepted and disappears with the session;
+#      nothing persistent is written.
+#   3. the connection authenticates as the service principal above, which holds
+#      SELECT only — no write privilege — on all four schemas.
+#
+# The approval rule below is belt-and-braces for the OMP client specifically: it
+# blocks a write-capable `execute_sql` tool outright should the endpoint ever
+# advertise one. `tools.approval` is absolute — a user `deny` is honored in every
+# approval mode, including `yolo`, so the agent cannot bypass it. The governed
+# service does not expose `execute_sql`, so the rule only fires if the endpoint
+# URL above is repointed at a write-capable server.
+tools:
+  approval:
+    mcp__databricks_execute_sql: deny

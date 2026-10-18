@@ -8,3 +8,7 @@ target/
 
 # Personal learning readme (gitignored)
 dbt_readme.md
+
+# Throwaway DAGSTER_HOME directories created by `dagster dev` and the test suite
+.tmp_dagster_home_*/
+

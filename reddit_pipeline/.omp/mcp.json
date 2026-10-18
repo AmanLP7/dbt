@@ -1,13 +1,1 @@
-{
-  "$schema": "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json",
-  "mcpServers": {
-    "databricks": {
-      "type": "http",
-      "url": "https://dbc-180d6d5c-8ac3.cloud.databricks.com/ai-gateway/mcp-services/workspace.reddit.dbsql_read_only",
-      "timeout": 120000,
-      "headers": {
-        "Authorization": "!databricks auth token --profile DEFAULT | python3 -c \"import sys,json;print('Bearer '+json.load(sys.stdin)['access_token'])\""
-      }
-    }
-  }
-}
+../../.omp/mcp.json
