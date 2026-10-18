@@ -1,0 +1,22 @@
+# The orchestration layer: a package, not a second dependency file. Its framework
+# pins (`dagster`, `dagster-dbt`) live in the root requirements.txt beside the
+# extractors' and dbt's, so one environment and one install command cover the whole
+# pipeline:
+#   pip install -r requirements.txt -r requirements-dev.txt -e orchestration
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "reddit-pipeline-orchestration"
+version = "0.1.0"
+description = "Dagster definitions orchestrating the Reddit ELT pipeline (extractors -> dbt)."
+requires-python = ">=3.10"
+
+# Read by the `dagster` CLI when it is invoked from this directory, so
+# `dagster dev` / `dagster asset materialize` need no `-m` flag.
+[tool.dagster]
+module_name = "reddit_pipeline_orchestration.definitions"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/reddit_pipeline_orchestration"]

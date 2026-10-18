@@ -20,7 +20,7 @@ select = [
 pythonVersion = "3.10"
 exclude = ["target", "dbt_packages", "logs", ".ruff_cache", ".pytest_cache", "__pycache__"]
 # Runtime deps (praw, databricks-sql-connector, databricks-sdk, python-dotenv,
-# prefect, dbt-databricks) live in requirements.txt. reportMissingImports stays
-# enabled rather than silenced: on a checkout where they are not installed it is
+# dagster, dagster-dbt, dbt-databricks) live in requirements.txt. reportMissingImports
+# stays enabled rather than silenced: on a checkout where they are not installed it is
 # the signal that the environment is incomplete, and it still surfaces a
 # genuinely missing import.

@@ -31,7 +31,9 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt -r requirements-dev.txt
+          # `-e orchestration` puts the Dagster code location on the interpreter's
+          # path, which pyright and pytest both need to import it.
+          pip install -r requirements.txt -r requirements-dev.txt -e orchestration
 
       # ruff and pyright resolve imports against the environment installed above.
       - name: ruff format
@@ -57,8 +59,9 @@ jobs:
           DATABRICKS_TOKEN: dapi-ci-placeholder
         run: dbt parse --profiles-dir profiles
 
-      # Behaviour tests for the extractors and the flow (stubbed clients; no
-      # network and no warehouse).
+      # Behaviour tests for the extractors and the Dagster code location (stubbed
+      # clients; no network and no warehouse). conftest.py re-parses the project before
+      # importing the code location, so collection never reads a stale manifest.
       - name: pytest
         run: pytest
 

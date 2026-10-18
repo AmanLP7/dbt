@@ -131,6 +131,29 @@ def reddit_client() -> praw.Reddit:
     )
 
 
+def databricks_config() -> Config:
+    """The Databricks CLI login from `~/.databrickscfg`, which refreshes itself.
+
+    `auth_type = databricks-cli` makes the SDK return the CLI's cached OAuth token
+    and run the CLI's own refresh when it has expired. That is why the extractors
+    never pass a token. The dbt step does need one in `DATABRICKS_TOKEN`, but mints
+    it from this same config per run (`databricks_token()`) rather than trusting a
+    value that may have been sitting in `.env` since the last login.
+    """
+    return Config(profile=os.getenv("DATABRICKS_CONFIG_PROFILE", "DEFAULT"))
+
+
+def databricks_token() -> str:
+    """A freshly minted bearer token, for callers that want a token, not a provider.
+
+    `profiles/profiles.yml` hands dbt a `DATABRICKS_TOKEN` and the dbt CLI has no
+    way to accept a credentials provider, so the orchestrator derives one here at
+    run time rather than letting the dbt subprocess inherit whatever the process
+    started with.
+    """
+    return databricks_config().authenticate()["Authorization"].split(" ", 1)[1]
+
+
 def connect() -> tuple[Connection, Cursor]:
     """Open a Databricks SQL connection and its cursor.
 
@@ -140,11 +163,11 @@ def connect() -> tuple[Connection, Cursor]:
     request, so `credentials_provider=config.authenticate` alone fails with
     "'dict' object is not callable".
     """
-    databricks_config = Config(profile=os.getenv("DATABRICKS_CONFIG_PROFILE", "DEFAULT"))
+    config = databricks_config()
     connection = sql.connect(
         server_hostname=os.getenv("DATABRICKS_HOSTNAME"),
         http_path=os.getenv("DATABRICKS_HTTP_PATH"),
-        credentials_provider=lambda: databricks_config.authenticate,
+        credentials_provider=lambda: config.authenticate,
     )
     return connection, connection.cursor()
 

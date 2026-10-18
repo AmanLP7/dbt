@@ -1,7 +1,7 @@
-# dbt profile for this repo, used by the flow via `--profiles-dir profiles`.
+# dbt profile for this repo, used by the Dagster dbt asset via `--profiles-dir profiles`.
 #
-# It authenticates with a token that the flow derives from the same Databricks CLI
-# profile the extractors use (`databricks auth login`), so one login covers both
+# It authenticates with a token that the code location derives from the same Databricks
+# CLI profile the extractors use (`databricks auth login`), so one login covers both
 # ingestion and the mart build. Host and http path come from .env — the same
 # values the extractors connect with — so the two halves of the pipeline cannot
 # disagree about which workspace they write to.
@@ -12,7 +12,8 @@
 #
 #   DBT_PROFILES_DIR=profiles dbt build
 #
-# (manual runs need DATABRICKS_TOKEN set; the flow sets it from the CLI profile).
+# (manual runs need DATABRICKS_TOKEN set; the code location sets it from the CLI
+# profile).
 reddit_pipeline:
   target: dev
   outputs:

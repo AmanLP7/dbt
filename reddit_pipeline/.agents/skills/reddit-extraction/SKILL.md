@@ -1,7 +1,7 @@
 ---
 name: reddit-extraction
-description: Running, debugging, or smoke-testing the three Reddit extraction modules, the shared `_common.py` scaffolding they rely on, the two Prefect flows that orchestrate them (`reddit-extract`, which hands off to `dbt-build`) — what each loads into Databricks, the function entrypoints and the raise-not-sys.exit rule retries depend on, the required .env variables, the rolling 5-hour window that makes the posts/comments loads incremental, the key-based upsert for users, the single parameterised insert path, the trailing `ingested_at` column, the missing runtime dependencies, and how to exercise the modules end to end without network or credentials using stubbed clients.
-globs: ["ingestion/reddit/**/*.py", "flows/**/*.py", "tests/**/*.py"]
+description: Running, debugging, or smoke-testing the three Reddit extraction modules, the shared `_common.py` scaffolding they rely on, the Dagster code location that orchestrates them (three extractor assets merged into the dbt sources, then one `dbt build` asset) — what each loads into Databricks, the function entrypoints and the raise-not-sys.exit rule retries depend on, the required .env variables, the rolling 5-hour window that makes the posts/comments loads incremental, the key-based upsert for users, the single parameterised insert path, the trailing `ingested_at` column, the missing runtime dependencies, and how to exercise the modules end to end without network or credentials using stubbed clients.
+globs: ["ingestion/reddit/**/*.py", "orchestration/**/*.py", "tests/**/*.py"]
 ---
 
 # Reddit extraction scripts
@@ -28,35 +28,39 @@ python -m ingestion.reddit.extract_reddit
 The `-m` form (`ingestion/reddit/_common.py` and the extractors use absolute
 imports) must be run from the repo root.
 
-`flows/reddit_extract_flow.py` imports the three and wraps each in a Prefect
-task — `fetch-posts`, `fetch-comments`, `fetch-users` — inside the
-`reddit-extract` flow, called in the order posts -> comments -> users (comments
-and users derive from the same hot posts, so the order matters), then calls
-`flows/dbt_build_flow.py`. The dbt flow's single task, `run-dbt-build`, shells out
-to `dbt build --profiles-dir profiles` from the repo root. With no `--select` that
-builds and tests every model in the project, so the step works on a warehouse
-where dbt has never run. It needs `dbt` on PATH — if `shutil.which("dbt")` finds
-nothing the task raises a `RuntimeError` naming the fix rather than failing
-obscurely. Both flows sit in `flows/`, outside `ingestion/`, because they span
-ingestion and the dbt transformation: `reddit-extract` runs the loads, then calls
-the dbt flow as a nested flow run (`dbt-build` has no deployment of its own), so
-a failed build fails the extract run. `reddit-extract` is deployed to the
-`reddit-pool` process work pool by `prefect.yaml` for on-demand runs; `dbt-build`
-is not deployed separately. Each task retries 3 times with delays of
-10s / 60s / 300s plus jitter; run it with `python -m flows.reddit_extract_flow`.
+`orchestration/src/reddit_pipeline_orchestration/definitions.py` imports the three
+and wraps each in a Dagster asset — `reddit_raw/r_worldnews`,
+`reddit_raw/r_comments`, `reddit_raw/r_users` — plus one `@dbt_assets` definition,
+`dbt_reddit`. Comments and users declare `deps=[RAW_POSTS_KEY]`, so the job runs
+posts -> comments/users -> dbt (comments and users derive from the same hot posts,
+so the order matters). Each extractor asset is declared under the asset key Dagster
+derives for its `reddit_raw.r_*` source, so the source spec merges into the extractor
+and the staging models depend on the loads. `dbt_reddit` runs
+`dbt build --profiles-dir profiles` from the repo root through `DbtCliResource`; with
+no `--select` that builds and tests every model in the project, so the step works on a
+warehouse where dbt has never run. The dbt models declare their own dependencies from
+the manifest, so they are not hand-listed in the job. `reddit_refresh` is a job over
+`AssetSelection.all()` with **no schedule** — runs are on demand, from the UI or
+`dagster asset materialize`. All four assets carry three retries with an exponential
+backoff plus jitter, ported from the Prefect tasks. See
+`orchestration/README.md` for the full graph, commands and deployment notes.
 
-**Credentials are shared.** `run-dbt-build` does not rely on dbt's own auth: it
-derives a token with `databricks.sdk.core.Config(profile=…).authenticate()` from
-the same Databricks CLI profile the extractors use, and passes `DATABRICKS_TOKEN`
-(plus the `.env` host/http_path) in the subprocess environment. One
-`databricks auth login` covers both halves, and the two cannot disagree about the
-workspace. Passing a token is deliberate: dbt-databricks' own `auth_type: oauth`
-is a browser U2M flow that cannot complete unattended. `profiles/profiles.yml` is
-the repo-owned profile the task points dbt at (`--profiles-dir profiles`).
+**Credentials are shared.** The dbt asset does not rely on dbt's own auth:
+`refresh_dbt_token()` mints a token with
+`databricks.sdk.core.Config(profile=…).authenticate()` from the same Databricks CLI
+profile the extractors use and exports it as `DATABRICKS_TOKEN` immediately before
+`dbt` runs (the token is also refreshed when the code location loads, so a
+long-lived server does not serve an expired one). One `databricks auth login` covers
+both halves, and the two cannot disagree about the workspace. Passing a token is
+deliberate: dbt-databricks' own `auth_type: oauth` is a browser U2M flow that cannot
+complete unattended. `profiles/profiles.yml` is the repo-owned profile the resource
+points dbt at (`--profiles-dir profiles`). If the CLI profile is unavailable, the
+refresh logs a warning and leaves an existing `DATABRICKS_TOKEN` in place — that is
+the CI path.
 
-The entrypoints `raise` on failure and **never call `sys.exit(1)`**. Prefect records
-a raised exception as `Failed`, the only state the retry policy acts on; `sys.exit`
-is recorded as `Crashed` and is not retried. Keep that rule when editing these
+The entrypoints `raise` on failure and **never call `sys.exit(1)`**. Dagster records
+a raised exception as a failed materialization, the only state the retry policy acts
+on; `sys.exit` ends the worker process instead. Keep that rule when editing these
 scripts.
 
 ## Shared scaffolding (`ingestion/reddit/_common.py`)
@@ -172,15 +176,16 @@ SDK refreshes. Notes:
   per request (`databricks/sql/auth/authenticators.py`), so passing
   `credentials_provider=databricks_config.authenticate` directly raises
   `RequestError: 'dict' object is not callable`.
-- `databricks-sdk` provides `Config`; the same library gives the flow its token.
+- `databricks-sdk` provides `Config`; the same library gives the dbt asset its token.
 - The profile's host must match `DATABRICKS_HOSTNAME`; the OAuth token is scoped
   to one workspace.
 
 Runtime deps (pinned in `requirements.txt`): `praw`, `databricks-sql-connector`
 (provides `databricks.sql`), `databricks-sdk` (provides `databricks.sdk`),
-`python-dotenv`, and `dbt-databricks` (provides the `dbt` CLI the dbt flow's
-`run-dbt-build` task shells out to; nothing imports it, so it does not affect
-`pyright`). `pip install -r requirements.txt` puts them in the active
+`python-dotenv`, `dbt-databricks` (provides the `dbt` CLI the dbt asset invokes;
+nothing imports it, so it does not affect `pyright`), and the orchestration pair
+`dagster`/`dagster-dbt` plus `dagster-webserver` for `dagster dev`.
+`pip install -r requirements.txt -e orchestration` puts them in the active
 environment, after which `pyright` stops reporting missing imports.
 
 ## Logging
@@ -236,11 +241,12 @@ names, tuple widths, row counts, and the bound delete parameters.
 `credentials_provider` factory.
 
 The maintained version of this recipe is the offline suite in `tests/`:
-`conftest.py` wires the fakes into exactly these patch points and stubs
-`dotenv.load_dotenv` before importing the project modules, so a developer's real
-`.env` cannot leak in; `fakes.py` holds the doubles, and `test_extractors.py`,
-`test_flow.py`, `test_dbt_build_flow.py` and `test_window_contract.py` assert the
-behaviour. Run it with `pytest`.
+`conftest.py` wires the fakes into exactly these patch points, stubs
+`dotenv.load_dotenv` before importing the project modules (so a developer's real
+`.env` cannot leak in) and defaults the dummy `DATABRICKS_*` values the code
+location needs for `dbt parse`; `fakes.py` holds the doubles, and
+`test_extractors.py`, `test_definitions.py`, `test_extract_assets.py` and
+`test_window_contract.py` assert the behaviour. Run it with `pytest`.
 
 ## Debugging
 

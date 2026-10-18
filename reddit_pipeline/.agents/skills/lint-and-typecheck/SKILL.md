@@ -15,7 +15,7 @@ ruff check .                                    # report Python violations
 ruff check --fix .                              # apply safe Python auto-fixes
 ruff format .                                   # format Python and the Python fences in *.md (authoritative)
 pyright                                         # type check Python
-pytest                                          # offline extractor/flow/window tests
+pytest                                          # offline extractor/orchestration/window tests
 DBT_PROFILES_DIR=profiles dbt parse             # parse models/yml/properties; no warehouse connection
 ```
 
@@ -34,14 +34,15 @@ per uninstalled import.
 ## What `ruff format` covers
 
 **`ruff format` covers Markdown; `ruff check` does not.** ruff formats Python code
-fences inside `.md` files, so `ruff format --check .` covers **20 files**: the 16
+fences inside `.md` files, so `ruff format --check .` covers **20 files**: the 15
 Python sources — 6 under `ingestion/` (`ingestion/__init__.py`,
 `ingestion/reddit/__init__.py`, `ingestion/reddit/_common.py`, and the three
-extractors), 3 under `flows/` (`flows/__init__.py`, `flows/dbt_build_flow.py`,
-`flows/reddit_extract_flow.py`) and 7 under `tests/` (`tests/__init__.py`,
-`tests/conftest.py`, `tests/fakes.py`, `tests/test_dbt_build_flow.py`,
-`tests/test_extractors.py`, `tests/test_flow.py`, `tests/test_window_contract.py`)
-— plus `README.md` and the 3 `.agents/skills/*/SKILL.md` files. Editing a doc can
+extractors), 2 under `orchestration/src/reddit_pipeline_orchestration/`
+(`__init__.py`, `definitions.py`) and 7 under `tests/` (`tests/__init__.py`,
+`tests/conftest.py`, `tests/fakes.py`, `tests/test_definitions.py`,
+`tests/test_extract_assets.py`, `tests/test_extractors.py`,
+`tests/test_window_contract.py`) — plus `README.md`, `orchestration/README.md` and
+the 3 `.agents/skills/*/SKILL.md` files. Editing a doc can
 therefore turn `ruff format --check .` red. `ruff check` is narrower: given a `.md`
 path it reports `No Python files found under the given path(s)`. After editing
 docs, run `ruff format .` to keep the check green.
@@ -56,10 +57,11 @@ order, no trailing whitespace.
 | `.sqlfluff` | dialect, templater, `ignore_paths`, all rule tuning |
 | `pyproject.toml` | `[tool.ruff]`, `[tool.ruff.lint]`, `[tool.pyright]` |
 | `requirements-dev.txt` | pinned versions: sqlfluff 4.4.0, ruff 0.17.0, pyright 1.1.414, debugpy 1.8.22, pytest 8.4.2 |
-| `requirements.txt` | pinned runtime deps: prefect 3.8.8, praw 8.0.3, databricks-sql-connector 4.4.0, databricks-sdk 0.117.0, python-dotenv 1.2.4, dbt-databricks 1.12.6 |
+| `requirements.txt` | pinned runtime deps: dagster 1.13.26, dagster-dbt 0.29.26, dagster-webserver 1.13.26, praw 8.0.3, databricks-sql-connector 4.4.0, databricks-sdk 0.117.0, python-dotenv 1.2.4, dbt-databricks 1.12.6 |
 
 Install into the **active** Python environment: `pip install -r requirements-dev.txt`
-and, for running the pipeline itself, `pip install -r requirements.txt`.
+and, for running the pipeline itself, `pip install -r requirements.txt -e orchestration`
+(the editable install is what puts the Dagster code location on the interpreter's path).
 
 ## Non-obvious facts
 
@@ -105,10 +107,9 @@ findings; the rule is deliberately not disabled so an incomplete environment sta
 visible. There is no per-import count to quote — it is simply one finding per
 unresolved import.
 
-`python-dotenv` is already importable here because Prefect depends on it, so the
-`import dotenv` line resolves. Do not "fix" that asymmetry by pinning or
-uninstalling dotenv: the scripts' `.env` handling is a genuine runtime dependency
-and the package is pinned in `requirements.txt`.
+`python-dotenv` is pinned in `requirements.txt` because the extractors genuinely read
+`.env`, so `import dotenv` resolves once the runtime requirements are installed. Do
+not uninstall it on the assumption that dbt or Dagster provides it.
 
 **`dbt parse` needs no warehouse.** CI runs it with dummy `DATABRICKS_*` values,
 because `profiles/profiles.yml` only reads them through `env_var(...)` and parsing
@@ -124,17 +125,22 @@ DATABRICKS_HOSTNAME=... DATABRICKS_HTTP_PATH=... DATABRICKS_TOKEN=... \
 **CI has two jobs.** `.github/workflows/ci.yml` triggers on push to `main` and on
 every pull request:
 
-- `lint`, on `ubuntu-latest` with Python 3.10, installs both requirements files
-  and then runs `ruff format --check .`, `ruff check .`, `sqlfluff lint`,
-  `pyright`, `dbt parse --profiles-dir profiles` (with dummy `DATABRICKS_*` env)
-  and `pytest`, failing on any non-zero exit.
+- `lint`, on `ubuntu-latest` with Python 3.10, installs the runtime requirements,
+  the dev tooling and the orchestration package (`-e orchestration`) and then runs
+  `ruff format --check .`, `ruff check .`, `sqlfluff lint`, `pyright`,
+  `dbt parse --profiles-dir profiles` (with dummy `DATABRICKS_*` env) and
+  `pytest`, failing on any non-zero exit.
 - `workflow-lint` runs `docker://rhysd/actionlint:1.7.7` to lint the workflow
   files themselves (syntax, expression contexts, action inputs/outputs).
 
 **pytest is offline.** `tests/` holds the suite; `conftest.py` patches the fakes
-into `ingestion.reddit._common` (`praw.Reddit`, `sql.connect`, `time`, `Config`)
-and neutralises `load_dotenv`, so no network and no warehouse are needed. pyright
-covers `tests/` too, so keep new fixtures typed.
+into `ingestion.reddit._common` (`praw.Reddit`, `sql.connect`, `time`, `Config`),
+neutralises `load_dotenv`, defaults the dummy `DATABRICKS_*` values the parse needs,
+points `DATABRICKS_CONFIG_FILE` at a nonexistent file so no ambient CLI profile is
+read, and runs `dbt parse --no-partial-parse` before any test module imports the code
+location. That last step is why a fresh checkout (no `target/`) and a stale
+partial-parse cache both still work: `prepare_if_dev()` in `definitions.py` is a no-op
+outside `dagster dev`. pyright covers `tests/` too, so keep new fixtures typed.
 
 **Never install these tools with `uv tool`.** `~/.local/bin` precedes the pyenv
 shims on `PATH` in this shell, so a uv-tool copy of `ruff`/`sqlfluff` shadows the

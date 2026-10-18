@@ -2,10 +2,19 @@
 #   pip install -r requirements.txt
 # Dev/lint tooling is separate: requirements-dev.txt
 
-# Pipeline orchestration. Verified installed here: a flow with two tasks runs
-# end to end against Prefect's ephemeral server — no `prefect server start`
-# and no Prefect Cloud account required.
-prefect==3.8.8
+# Orchestrates the pipeline (orchestration/), which is why they are runtime pins
+# rather than dev tooling: the orchestrated run needs them in the same
+# environment as the extractors and dbt. Version-matched pair — dagster-dbt 0.29.x
+# tracks dagster 1.13.x — so bump them together with a green CI run.
+dagster==1.13.26
+dagster-dbt==0.29.26
+
+# The UI: `dagster dev` refuses to start without it ("the dagster-webserver
+# Python package must be installed in order to use the dagster dev command").
+# Not installed by dagster itself, so the documented `dagster dev` command fails
+# on a fresh environment without this line. Must track dagster's version exactly
+# (dagster-webserver 1.13.x for dagster 1.13.x).
+dagster-webserver==1.13.26
 
 # Required by the extraction scripts, which run where Reddit and Databricks are
 # reachable. Pinned so CI and the warehouse runs resolve identical versions; bump
@@ -15,13 +24,13 @@ prefect==3.8.8
 #   praw                      -> import praw
 #   databricks-sql-connector  -> import databricks.sql
 #   databricks-sdk            -> import databricks.sdk  (profile credentials)
-#   python-dotenv             -> import dotenv  (already present as a Prefect dep)
+#   python-dotenv             -> import dotenv  (loads .env in _common.py)
 praw==8.0.3
 databricks-sql-connector==4.4.0
 databricks-sdk==0.117.0
 python-dotenv==1.2.4
 
-# Runs the `dbt build` mart step that ends the flow: provides the `dbt` console
+# Runs the `dbt build` step that ends the pipeline: provides the `dbt` console
 # script and the Databricks adapter. Pinned to the version the models were
 # verified against. Model linting (sqlfluff) lints the same SQL with no warehouse
 # and stays in requirements-dev.txt.

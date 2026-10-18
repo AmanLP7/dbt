@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -14,15 +16,42 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:  # make `ingestion` importable when pytest is run from elsewhere
     sys.path.insert(0, str(REPO_ROOT))
 
+# The code location builds its dbt assets from `target/manifest.json` at import time,
+# and `prepare_if_dev()` there only refreshes it under `dagster dev`. Parsing here,
+# before any test module imports the location, makes collection independent of what
+# `target/` happens to hold: a fresh checkout has no manifest at all, and a partial
+# parse cache left by an interrupted run can produce one whose dependency edges no
+# longer match the models. `--no-partial-parse` costs about a second over a cached
+# parse and removes that second source of drift.
+#
+# The committed profile resolves DATABRICKS_* through `env_var(...)`, and a parse
+# needs the values present but never opens a connection.
+os.environ.setdefault("DATABRICKS_HOSTNAME", "https://example.invalid")
+os.environ.setdefault("DATABRICKS_HTTP_PATH", "/sql/1.0/warehouses/000")
+os.environ.setdefault("DATABRICKS_TOKEN", "dapi-test-placeholder")
+
+# `definitions.py` mints a token from the Databricks CLI profile at import. Left to
+# the developer's own `~/.databrickscfg` that would read ambient credentials, replace
+# the placeholder above, and, when the cached token has expired, try to refresh it
+# over the network. A config file that does not exist makes the mint fail fast with
+# the documented fall-through instead.
+os.environ.setdefault("DATABRICKS_CONFIG_FILE", "/nonexistent/databrickscfg")
+
+subprocess.run(
+    ["dbt", "parse", "--no-partial-parse", "--quiet", "--profiles-dir", "profiles"],
+    cwd=REPO_ROOT,
+    check=True,
+)
+
 
 def _no_dotenv(*_args: object, **_kwargs: object) -> bool:
     """Stand-in for `load_dotenv`, installed before the project modules import it."""
     return False
 
 
-# `ingestion.reddit._common` and `flows.dbt_build_flow` call `load_dotenv()` at
-# import time, so the stub has to be in place first: a developer's real .env must
-# not reach os.environ during the test session.
+# `ingestion.reddit._common` calls `load_dotenv()` at import time, so the stub has
+# to be in place first: a developer's real .env must not reach os.environ during the
+# test session.
 dotenv.load_dotenv = _no_dotenv
 
 from ingestion.reddit import _common  # noqa: E402
