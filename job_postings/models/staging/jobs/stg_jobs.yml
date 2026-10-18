@@ -1,0 +1,23 @@
+version: 2
+
+models:
+  - name: stg_job_postings
+    description: >
+      One row per listing per source, deduped to the newest fetch. The HTML of
+      the source descriptions is stripped and tags are cast back to an array, so
+      downstream models see plain text and can filter on title_normalized.
+    columns:
+      - name: job_key
+        description: Natural key of a posting, `source || ':' || source_job_id`.
+        data_tests:
+          - unique
+          - not_null
+      - name: source_job_id
+        data_tests:
+          - not_null
+      - name: title_normalized
+        description: Lower-cased, trimmed title — the field role matching reads.
+      - name: tags
+        description: Source tags cast from the raw JSON string to array<string>.
+      - name: description_text
+        description: Description with HTML tags stripped and whitespace collapsed.

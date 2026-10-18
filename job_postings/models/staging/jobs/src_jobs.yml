@@ -1,0 +1,46 @@
+version: 2
+
+sources:
+  # dbt defaults a source's `database` to the target's catalog but its `schema`
+  # to the source *name*, which would resolve to workspace.jobs. Both are
+  # therefore read from JOB_POSTINGS_CATALOG/JOB_POSTINGS_SCHEMA — the same
+  # variables raw_table_fqn() in ingestion/jobs/_common.py reads — falling back to
+  # the active target, so the source cannot drift from where the extractor writes
+  # even when those overrides are set.
+  - name: jobs
+    database: "{{ env_var('JOB_POSTINGS_CATALOG', target.catalog) }}"
+    schema: "{{ env_var('JOB_POSTINGS_SCHEMA', target.schema) }}"
+    description: >
+      Raw job listings landed by the keyless-API extractors. Append-only: every
+      fetch inserts a fresh row stamped with ingested_at, so postings retained
+      across runs accumulate history rather than being overwritten.
+    tables:
+      - name: raw_job_postings
+        description: >
+          One row per listing per fetch, straight from the source payload
+          (remotive, arbeitnow, jobicy). Populated by
+          `python -m ingestion.jobs.fetch_job_postings`.
+        # `loaded_at_field` lives under `config:` because dbt 1.12 deprecates
+        # the top-level source-table properties (same as src_reddit.yml).
+        config:
+          loaded_at_field: ingested_at
+        columns:
+          - name: source
+            description: Originating job API.
+            data_tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    values: ["remotive", "arbeitnow", "jobicy"]
+          - name: source_job_id
+            description: The posting id within its source.
+            data_tests:
+              - not_null
+          - name: title
+            description: Listing title as published (role filtering keys off this).
+          - name: tags_json
+            description: Source tags as a JSON array string; cast in staging.
+          - name: ingested_at
+            description: UTC time the extractor wrote the row.
+            data_tests:
+              - not_null

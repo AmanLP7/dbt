@@ -1,0 +1,33 @@
+# dbt profile for this repo, used in CI via `dbt parse --profiles-dir profiles`.
+#
+# The profile is committed so the repo carries its own authentication story
+# rather than depending on the machine's ~/.dbt/profiles.yml. Host and http path
+# come from .env — the same values the extractor connects with — so ingestion and
+# the models cannot disagree about which workspace they write to.
+#
+# It authenticates with a token read from DATABRICKS_TOKEN in the environment;
+# the extractor derives that from the Databricks CLI profile it logs in with
+# (`databricks auth login`), so one login covers both halves of the pipeline.
+#
+# Invoking `dbt` by hand still resolves ~/.dbt/profiles.yml unless you point it
+# here:
+#
+#   DBT_PROFILES_DIR=profiles dbt build
+#
+# (manual runs need DATABRICKS_TOKEN set).
+job_postings:
+  target: dev
+  outputs:
+    dev:
+      type: databricks
+      catalog: workspace
+      schema: job_postings
+      # .env carries DATABRICKS_HOSTNAME as a URL (the extractor accepts a bare host
+      # too, and normalises the scheme away before connecting — see connect() in
+      # ingestion/jobs/_common.py); dbt wants the bare host with no trailing slash,
+      # and passing "https://" through makes it probe "https://https://..." on
+      # every command.
+      host: "{{ env_var('DATABRICKS_HOSTNAME') | replace('https://', '') | replace('http://', '') | trim | trim('/') }}"
+      http_path: "{{ env_var('DATABRICKS_HTTP_PATH') }}"
+      token: "{{ env_var('DATABRICKS_TOKEN') }}"
+      threads: 4

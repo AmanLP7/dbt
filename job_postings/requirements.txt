@@ -1,0 +1,40 @@
+# Runtime dependencies for the job-postings pipeline.
+#   pip install -r requirements.txt
+# Dev/lint tooling is separate: requirements-dev.txt
+
+# Required by the extraction script, which runs where the three job APIs and
+# Databricks are reachable. Pinned so CI and the warehouse runs resolve identical
+# versions; bump them together with a green CI run. Install with
+# `pip install -r requirements.txt` into the active environment, not as a `uv
+# tool`, or the installed console scripts can shadow the environment's python.
+#   databricks-sql-connector  -> import databricks.sql  (the extractor's connection)
+#   databricks-sdk            -> import databricks.sdk.core  (the CLI-profile
+#                                credentials the extractor and the orchestrated
+#                                dbt step authenticate with); also pulled in by
+#                                dbt-databricks (<0.118.0), pinned so CI resolves
+#                                the same version as the warehouse runs
+#   python-dotenv             -> import dotenv  (used by ingestion/jobs/_common.py
+#                                to load .env)
+databricks-sql-connector==4.4.0
+databricks-sdk==0.117.0
+python-dotenv==1.2.4
+
+# Runs the dbt models: provides the `dbt` console script and the Databricks
+# adapter. Pinned to the version the models were verified against. Model linting
+# (sqlfluff) lints the same SQL with no warehouse and stays in
+# requirements-dev.txt.
+dbt-databricks==1.12.6
+
+# Orchestrates the pipeline (orchestration/), which is why they are runtime pins
+# rather than dev tooling: the orchestrated run needs them in the same
+# environment as the extractor and dbt. Version-matched pair — dagster-dbt 0.29.x
+# tracks dagster 1.13.x — so bump them together with a green CI run.
+dagster==1.13.26
+dagster-dbt==0.29.26
+
+# The UI: `dagster dev` refuses to start without it ("the dagster-webserver
+# Python package must be installed in order to use the dagster dev command").
+# Not installed by dagster itself, so the documented `dagster dev` command fails
+# on a fresh environment without this line. Must track dagster's version exactly
+# (dagster-webserver 1.13.x for dagster 1.13.x).
+dagster-webserver==1.13.26

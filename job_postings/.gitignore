@@ -1,0 +1,21 @@
+
+target/
+dbt_packages/
+logs/
+
+# Local secrets
+.env
+
+# Python / lint tooling caches
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+
+# The orchestration package installs editable (`pip install -e orchestration`), so
+# its build artifacts land next to the sources.
+orchestration/src/*.egg-info/
+
+# dbt writes an anonymous run id as .user.yml wherever it is invoked, so ignore
+# it at any level.
+.user.yml

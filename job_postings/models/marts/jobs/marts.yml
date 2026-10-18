@@ -1,0 +1,38 @@
+version: 2
+
+models:
+  - name: mart_role_listings
+    description: >
+      Open listings narrowed to the roles in seeds/role_keywords.csv. A posting
+      matching several keyword rows appears once per role family.
+    columns:
+      - name: role_family
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('role_keywords')
+                field: role_family
+      - name: job_key
+        data_tests:
+          - not_null
+      - name: title
+        data_tests:
+          - not_null
+      - name: description_text
+        description: >
+          Listing description carried over from staging with HTML tags stripped
+          and whitespace collapsed. Null when the source published none.
+      - name: url
+        description: Direct link to the listing on the source board.
+
+  - name: mart_role_summary
+    description: Listing counts and company counts per role family.
+    columns:
+      - name: role_family
+        data_tests:
+          - unique
+          - not_null
+      - name: open_listings
+        data_tests:
+          - not_null

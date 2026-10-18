@@ -1,0 +1,8 @@
+# Development-only tooling. Not needed to run the pipeline or dbt models.
+# Install into the active Python environment:
+#   pip install -r requirements-dev.txt
+ruff==0.17.0
+sqlfluff==4.4.0
+pyright==1.1.414
+debugpy==1.8.22
+pytest==8.4.2
