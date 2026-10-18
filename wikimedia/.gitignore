@@ -1,0 +1,19 @@
+target/
+dbt_packages/
+logs/
+
+# Local secrets (Databricks credentials)
+.env
+
+# The consumer's SSE resume checkpoint: machine-local, rewritten every flush.
+.state/
+
+# Python / lint tooling caches
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+
+# dbt writes an anonymous run id as .user.yml wherever it is invoked, so ignore
+# it at any level.
+.user.yml

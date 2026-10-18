@@ -1,0 +1,22 @@
+# Runtime dependencies for the Wikimedia streaming pipeline.
+#   pip install -r requirements.txt
+# Dev/lint tooling is separate: requirements-dev.txt
+
+# Required by the streaming consumer, which runs where the Wikimedia firehose
+# and Databricks are both reachable. Pinned so CI and warehouse runs resolve
+# identical versions; bump them together with a green run.
+#   requests                  -> the SSE long-poll against stream.wikimedia.org
+#   databricks-sql-connector  -> import databricks.sql  (micro-batch INSERTs)
+#   databricks-sdk            -> import databricks.sdk  (profile credentials)
+#   python-dotenv             -> import dotenv  (.env loading)
+requests==2.34.2
+databricks-sql-connector==4.4.0
+databricks-sdk==0.117.0
+python-dotenv==1.2.4
+
+# The batch layer over the same raw table still to come: dbt-databricks builds
+# the staging/intermediate/marts models and Prefect runs the scheduled dbt step.
+# They are deliberately absent here rather than pinned ahead of the code that
+# needs them.
+#   dbt-databricks==1.12.6
+#   prefect==3.8.8

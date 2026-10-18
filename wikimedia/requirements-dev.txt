@@ -1,0 +1,4 @@
+# Dev/lint tooling. Runtime deps are separate: requirements.txt
+#   pip install -r requirements-dev.txt
+pytest==8.4.2
+ruff==0.17.0
