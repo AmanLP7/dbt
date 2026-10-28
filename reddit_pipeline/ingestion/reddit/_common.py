@@ -21,7 +21,7 @@ import os
 import time
 from collections import OrderedDict
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import praw
 from databricks import sql
@@ -30,6 +30,19 @@ from dotenv import load_dotenv
 
 if TYPE_CHECKING:
     from databricks.sql.client import Connection, Cursor
+
+
+class SqlExecutor(Protocol):
+    """The two cursor methods the loaders use, so a test double can stand in.
+
+    Typing these against the connector's `Cursor` would force every test to build
+    a real one; the loaders only ever `execute` and `fetchall`.
+    """
+
+    def execute(self, operation: str, parameters: Any = None) -> Any: ...
+
+    def fetchall(self) -> Sequence[Sequence[Any]]: ...
+
 
 # Rolling window (hours) on an entity's own created_utc: rows older than this are
 # left untouched, so posts and comments accumulate history across runs.
@@ -187,7 +200,7 @@ def load_timestamp() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
 
-def ensure_table(cursor: Cursor, table: str, columns: OrderedDict[str, str]) -> None:
+def ensure_table(cursor: SqlExecutor, table: str, columns: OrderedDict[str, str]) -> None:
     """Create the catalog, schema and table if they do not exist yet."""
     cursor.execute(f"CREATE CATALOG IF NOT EXISTS {CATALOG};")
     cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA};")
@@ -195,7 +208,7 @@ def ensure_table(cursor: Cursor, table: str, columns: OrderedDict[str, str]) -> 
     cursor.execute(f"CREATE TABLE IF NOT EXISTS {table} (\n        {column_defs}\n    );")
 
 
-def ensure_columns(cursor: Cursor, table: str, columns: OrderedDict[str, str]) -> None:
+def ensure_columns(cursor: SqlExecutor, table: str, columns: OrderedDict[str, str]) -> None:
     """Additively migrate a pre-existing table to the given column mapping.
 
     Idempotent: a table that already has every column is left alone, and a table
@@ -210,15 +223,67 @@ def ensure_columns(cursor: Cursor, table: str, columns: OrderedDict[str, str]) -
             cursor.execute(f"ALTER TABLE {table} ADD COLUMNS ({name} {type_name});")
 
 
-def _insert_sql(table: str, columns: OrderedDict[str, str]) -> str:
-    """Build the parameterised bulk insert for a table's column mapping."""
+# `executemany` sends one statement per row: measured against this warehouse it
+# cost 2.00 s per comment row and 1.68 s per user row, so a 200-user load spent
+# five and a half minutes on round trips. Rows are instead batched into
+# multi-row INSERTs, and both bounds below apply. The row cap keeps the
+# statement readable and the parameter count low; the character cap is the
+# server's own limit, which a single large body can exhaust on its own — DBSQL
+# rejects a statement whose parameters total more than _PARAMETER_CHARS. A row
+# bigger than the whole budget still goes alone; truncating it would break the
+# raw table's fidelity contract.
+INSERT_CHUNK_ROWS = 50
+_PARAMETER_CHARS = 1_048_576
+INSERT_CHUNK_CHARS = _PARAMETER_CHARS * 3 // 4
+
+
+def _row_chars(row: Sequence[Any]) -> int:
+    """Approximate the parameter cost of one row, in characters.
+
+    Strings dominate and are what the server counts; the rest are ids, scores
+    and timestamps, which contribute a constant few bytes each.
+    """
+    return sum(len(value) if isinstance(value, str) else 8 for value in row)
+
+
+def chunk_rows(rows: Sequence[Sequence[Any]]) -> list[list[Sequence[Any]]]:
+    """Split rows into chunks that respect both the row and the parameter budget."""
+    chunks: list[list[Sequence[Any]]] = []
+    current: list[Sequence[Any]] = []
+    size = 0
+    for row in rows:
+        cost = _row_chars(row)
+        if current and (len(current) >= INSERT_CHUNK_ROWS or size + cost > INSERT_CHUNK_CHARS):
+            chunks.append(current)
+            current, size = [], 0
+        current.append(row)
+        size += cost
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _insert_sql(table: str, columns: OrderedDict[str, str], row_count: int) -> str:
+    """Build one INSERT carrying `row_count` value tuples for a column mapping."""
     names = ", ".join(columns)
-    placeholders = ", ".join("?" for _ in columns)
-    return f"INSERT INTO {table} ({names}) VALUES ({placeholders})"
+    placeholders = ", ".join([f"({', '.join('?' for _ in columns)})"] * row_count)
+    return f"INSERT INTO {table} ({names}) VALUES {placeholders}"
+
+
+def _insert_rows(
+    cursor: SqlExecutor,
+    table: str,
+    columns: OrderedDict[str, str],
+    rows: Sequence[Sequence[Any]],
+) -> None:
+    """Insert `rows` in as few statements as the row and parameter budgets allow."""
+    for chunk in chunk_rows(rows):
+        params = tuple(value for row in chunk for value in row)
+        cursor.execute(_insert_sql(table, columns, len(chunk)), params)
 
 
 def replace_window(
-    cursor: Cursor,
+    cursor: SqlExecutor,
     table: str,
     columns: OrderedDict[str, str],
     rows: Sequence[tuple[Any, ...]],
@@ -234,12 +299,12 @@ def replace_window(
         logger.info("No rows to load into %s; skipping delete and insert.", table)
         return 0
     cursor.execute(f"DELETE FROM {table} WHERE {cutoff_col} >= ?;", (cutoff,))
-    cursor.executemany(_insert_sql(table, columns), rows)
+    _insert_rows(cursor, table, columns, rows)
     return len(rows)
 
 
 def replace_by_key(
-    cursor: Cursor,
+    cursor: SqlExecutor,
     table: str,
     columns: OrderedDict[str, str],
     rows: Sequence[tuple[Any, ...]],
@@ -257,5 +322,5 @@ def replace_by_key(
     keys = tuple(row[key_index] for row in rows)
     placeholders = ", ".join("?" for _ in keys)
     cursor.execute(f"DELETE FROM {table} WHERE {key} IN ({placeholders});", keys)
-    cursor.executemany(_insert_sql(table, columns), rows)
+    _insert_rows(cursor, table, columns, rows)
     return len(rows)

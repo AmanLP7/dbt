@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from ingestion.reddit import _common  # noqa: F401  (re-exported for callers' convenience)
 
 # Fixed clock: every test pins `_common`'s time.time() to this epoch second.
@@ -15,17 +17,12 @@ class FakeCursor:
     """Records every statement; `fetchall` answers `DESCRIBE TABLE`."""
 
     def __init__(self, described_columns: list[str] | None = None) -> None:
-        self.statements: list[tuple[str, object]] = []
-        self.bulk: list[tuple[str, list]] = []
+        self.statements: list[tuple[str, Any]] = []
         self._described = ALL_COLUMNS if described_columns is None else described_columns
         self.closed = False
 
-    def execute(self, sql: str, params: object = None) -> FakeCursor:
-        self.statements.append((sql, params))
-        return self
-
-    def executemany(self, sql: str, rows: list) -> FakeCursor:
-        self.bulk.append((sql, list(rows)))
+    def execute(self, operation: str, parameters: Any = None) -> FakeCursor:
+        self.statements.append((operation, parameters))
         return self
 
     def fetchall(self) -> list[tuple[str]]:
@@ -35,8 +32,18 @@ class FakeCursor:
         self.closed = True
 
     @property
-    def deletes(self) -> list[tuple[str, object]]:
+    def deletes(self) -> list[tuple[str, Any]]:
         return [statement for statement in self.statements if statement[0].startswith("DELETE")]
+
+    @property
+    def inserts(self) -> list[tuple[str, Any]]:
+        return [statement for statement in self.statements if statement[0].startswith("INSERT")]
+
+    def inserted(self, columns: dict[str, str] | list[str]) -> list[tuple[Any, ...]]:
+        """Regroup the bound INSERT parameters back into rows of `columns` width."""
+        width = len(columns)
+        params = [value for _, bound in self.inserts for value in (bound or ())]
+        return [tuple(params[index : index + width]) for index in range(0, len(params), width)]
 
     @property
     def alters(self) -> list[str]:
@@ -44,7 +51,7 @@ class FakeCursor:
 
     @property
     def sql_text(self) -> str:
-        return " ".join([sql for sql, _ in self.statements] + [sql for sql, _ in self.bulk])
+        return " ".join(sql for sql, _ in self.statements)
 
 
 class FakeConnection:

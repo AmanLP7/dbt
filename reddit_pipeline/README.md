@@ -168,11 +168,18 @@ written, not a value Reddit supplied):
   profile failures (suspended, deleted, private) are counted, logged at `WARNING`,
   and reported in the run summary rather than swallowed.
 
-Both strategies are **parameterised**: every value is bound as a `?` parameter via
-`executemany` and no value is interpolated into SQL text — only identifiers
-(table/column names) are. Logging is the stdlib `logging` module (no `print`);
-per-post progress is `DEBUG` and each run emits per-phase summaries at `INFO`,
-controlled by `LOG_LEVEL` (default `INFO`).
+Both strategies are **parameterised**: every value is bound as a `?` parameter and
+no value is interpolated into SQL text — only identifiers (table/column names) are.
+Rows are batched into multi-row `INSERT ... VALUES (...), (...)` statements rather
+than sent one statement per row: the connector's `executemany` costs a full round
+trip each, measured at 1.7–2.0 s per row against this warehouse, so a 200-user load
+spent five and a half minutes on round trips alone. With batching that same load
+wrote 200 users in 30.5 s, an 11× reduction. Each statement carries at most
+`INSERT_CHUNK_ROWS = 50` rows *and* at most `INSERT_CHUNK_CHARS` (~768 KB) of bound
+parameters, because DBSQL rejects a statement whose parameters total more than
+1 MiB and one long body can exhaust that on its own. Logging is the stdlib
+`logging` module (no `print`); per-post progress is `DEBUG` and each run emits
+per-phase summaries at `INFO`, controlled by `LOG_LEVEL` (default `INFO`).
 
 Two consequences worth knowing:
 

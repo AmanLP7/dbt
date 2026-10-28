@@ -90,12 +90,13 @@ rejected at startup, so a half-configured copy fails loudly. See
 
 ### Profile setup
 
-The repo carries its own dbt profile at `profiles/profiles.yml`, and `~/.dbt/profiles.yml`
-also has a `job_postings` target for hand-run `dbt` from anywhere. Either way the
-warehouse (catalog `workspace`, schema `job_postings`) comes from the profile, while
-`host`, `http_path` and `token` come from `env_var(...)` — the same host and path the
-extractor connects with, so ingestion and the models cannot disagree about which
-workspace they write to. The token is the one value the two halves source
+The repo carries its own dbt profile at `profiles/profiles.yml`, and a `profiles.yml`
+symlink beside `dbt_project.yml` makes a bare `dbt` inside this directory resolve it
+instead of `~/.dbt/profiles.yml` (which still describes the previous FREE workspace).
+Either way the warehouse (catalog `workspace`, schema `job_postings`) comes from the
+profile, while `host`, `http_path` and `token` come from `env_var(...)` — the same host
+and path the extractor connects with, so ingestion and the models cannot disagree about
+which workspace they write to. The token is the one value the two halves source
 differently: `dbt` has no way to accept a credentials provider, so the orchestrated
 run mints a token from the CLI profile at the start of each `dbt build`, while a
 hand-run needs `DATABRICKS_TOKEN` exported first.
@@ -244,6 +245,16 @@ statement — a single-page 440-row run landed in about 24 seconds across 9
 statements; a run at the current page cap batches roughly 1950 rows into ~39.
 Every value is bound as a `?` parameter; only the table name is interpolated.
 
+The row count alone is not a safe bound. DBSQL rejects a statement whose bound
+parameters total more than 1048576 characters, and a posting's `description` is
+often tens of KB of source HTML, so 50 of them overflow it: the first run on the
+2026-10-24 workspace failed with `Parameterized query's parameters are too large:
+the combined size of parameters is 2059161, exceeding the limit of 1048576
+characters`. `chunk_rows()` therefore splits on whichever limit is reached first —
+`INSERT_CHUNK_ROWS` rows or `INSERT_CHUNK_CHARS` (three quarters of the server
+limit) of parameter text. A row larger than the whole budget still goes alone and
+will still be rejected; nothing can shorten it without corrupting the raw record.
+
 ## Role keywords
 
 `seeds/role_keywords.csv` is the definition of the taxonomy:
@@ -277,8 +288,8 @@ values are enough). CI does the two steps in that order.
   normalisation (ISO, `Z`, offsets, epochs, garbage), the fail-soft loop
   (one broken source is skipped, all three failing aborts before connecting), and
   the drop of postings that arrive without a `source_job_id`.
-- `tests/test_raw_table.py`: statement chunking, bound parameters, one ingest stamp
-  per run, and the DDL/column-list contract.
+- `tests/test_raw_table.py`: statement chunking (row and parameter-size bounds),
+  bound parameters, one ingest stamp per run, and the DDL/column-list contract.
 - `tests/test_seed_contract.py`: seed shape and the `LIKE`-wildcard guard.
 - `tests/test_definitions.py`: the Dagster code location — the asset set, the
   extractor→staging merge, all 14 asset checks (including the 4 on the

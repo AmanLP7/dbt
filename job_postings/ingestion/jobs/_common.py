@@ -90,6 +90,16 @@ _ROW_PLACEHOLDER = "(" + ", ".join(["?"] * len(RAW_COLUMNS)) + ")"
 # tuples into a single statement converts N round trips into N / this.
 INSERT_CHUNK_ROWS = 50
 
+# ...but a row count alone is the wrong bound. DBSQL rejects a statement whose
+# parameters total more than _PARAMETER_CHARS, and a single posting's
+# `description` is often tens of KB of source HTML, so 50 of them overflow it: a
+# live run died with "combined size of parameters is 2059161, exceeding the
+# limit of 1048576". A chunk is therefore whatever fits both limits, rows first.
+# One row bigger than the budget still goes alone — splitting the string would
+# corrupt the raw table's fidelity contract.
+_PARAMETER_CHARS = 1_048_576
+INSERT_CHUNK_CHARS = _PARAMETER_CHARS * 3 // 4
+
 
 def utcnow() -> datetime:
     """Naive UTC timestamp; the connector rejects tz-aware datetimes."""
@@ -189,6 +199,32 @@ def ensure_raw_table(cursor: Any) -> None:
     LOGGER.info("Ensured raw table %s", fqn)
 
 
+def _row_chars(row: Sequence[Any]) -> int:
+    """Approximate the parameter cost of one row, in characters.
+
+    Strings dominate and are what the server counts; the remaining columns are a
+    source id, a URL and timestamps, which contribute a few bytes each.
+    """
+    return sum(len(value) if isinstance(value, str) else 8 for value in row)
+
+
+def chunk_rows(rows: Sequence[Sequence[Any]]) -> list[list[Sequence[Any]]]:
+    """Split rows into chunks that respect both the row and the parameter budget."""
+    chunks: list[list[Sequence[Any]]] = []
+    current: list[Sequence[Any]] = []
+    size = 0
+    for row in rows:
+        cost = _row_chars(row)
+        if current and (len(current) >= INSERT_CHUNK_ROWS or size + cost > INSERT_CHUNK_CHARS):
+            chunks.append(current)
+            current, size = [], 0
+        current.append(row)
+        size += cost
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def insert_postings(cursor: Any, postings: Iterable[dict[str, Any]]) -> int:
     """Append the normalised rows to the raw table, stamping ingest time.
 
@@ -203,8 +239,7 @@ def insert_postings(cursor: Any, postings: Iterable[dict[str, Any]]) -> int:
 
     fqn = raw_table_fqn()
     written = 0
-    for start in range(0, len(rows), INSERT_CHUNK_ROWS):
-        chunk = rows[start : start + INSERT_CHUNK_ROWS]
+    for chunk in chunk_rows(rows):
         # One statement carrying many value tuples; parameters stay bound.
         statement = _INSERT_PREFIX.format(fqn=fqn) + ", ".join([_ROW_PLACEHOLDER] * len(chunk))
         cursor.execute(statement, tuple(value for row in chunk for value in row))

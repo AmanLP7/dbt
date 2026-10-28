@@ -31,7 +31,7 @@ def test_posts_loads_only_rows_inside_the_window(warehouse, wire_reddit):
     written = extract_posts()
 
     assert written == 1
-    _, rows = warehouse.bulk[0]
+    rows = warehouse.inserted(_common.POSTS_COLUMNS)
     assert [row[0] for row in rows] == ["fresh"]
     # The window is enforced by the DELETE, bound as a parameter, not interpolated.
     delete_sql, params = warehouse.deletes[0]
@@ -44,7 +44,7 @@ def test_posts_writes_the_ingest_timestamp_on_every_row(warehouse, wire_reddit):
 
     extract_posts()
 
-    _, rows = warehouse.bulk[0]
+    rows = warehouse.inserted(_common.POSTS_COLUMNS)
     assert len(rows[0]) == len(_common.POSTS_COLUMNS)
     assert rows[0][-1] is not None  # ingested_at, stamped at load time
 
@@ -56,7 +56,7 @@ def test_empty_window_skips_both_delete_and_insert(warehouse, wire_reddit):
 
     assert written == 0
     assert warehouse.deletes == []
-    assert warehouse.bulk == []
+    assert warehouse.inserts == []
 
 
 def test_comment_values_are_bound_never_interpolated(warehouse, wire_reddit):
@@ -67,10 +67,10 @@ def test_comment_values_are_bound_never_interpolated(warehouse, wire_reddit):
     written = extract_comments()
 
     assert written == 1
-    insert_sql, rows = warehouse.bulk[0]
+    insert_sql, _ = warehouse.inserts[0]
     assert "?" in insert_sql
     assert body not in warehouse.sql_text  # the payload never reaches the SQL string
-    assert body in [row[2] for row in rows]  # it travels as a bound parameter
+    assert body in [row[2] for row in warehouse.inserted(_common.COMMENTS_COLUMNS)]  # it travels bound
 
 
 def test_a_table_predating_the_ingest_column_is_migrated(make_warehouse, wire_reddit):
@@ -82,7 +82,7 @@ def test_a_table_predating_the_ingest_column_is_migrated(make_warehouse, wire_re
     extract_comments()
 
     assert cursor.alters == [f"ALTER TABLE {COMMENTS_TABLE} ADD COLUMNS (ingested_at TIMESTAMP);"]
-    assert cursor.bulk == []
+    assert cursor.inserts == []
 
 
 def test_a_current_table_is_not_altered(warehouse, wire_reddit):
@@ -104,7 +104,7 @@ def test_users_skips_deleted_authors_and_duplicates(warehouse, wire_reddit):
     written = extract_users()
 
     assert written == 1
-    _, rows = warehouse.bulk[0]
+    rows = warehouse.inserted(_common.USERS_COLUMNS)
     assert [row[0] for row in rows] == ["alice"]
     # Key-based upsert: the fetched id is bound into the DELETE, not string-escaped.
     delete_sql, params = warehouse.deletes[0]

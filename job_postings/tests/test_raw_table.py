@@ -46,6 +46,23 @@ def test_insert_packs_rows_into_chunked_statements() -> None:
     assert [len(params) for _, params in cursor.inserts] == [50 * ROW_WIDTH, 50 * ROW_WIDTH, 20 * ROW_WIDTH]
 
 
+def test_insert_bounds_each_chunk_by_parameter_size() -> None:
+    """A row budget alone overflows DBSQL's parameter limit on real descriptions."""
+    cursor = FakeCursor()
+    description = "x" * (_common.INSERT_CHUNK_CHARS // 3)
+    rows = [raw_row(source_job_id=str(index), description=description) for index in range(7)]
+
+    written = _common.insert_postings(cursor, rows)
+
+    assert written == 7
+    # ~256 KB of description per row against a ~768 KB budget: two rows fit, a
+    # third does not, so the rows spread over four statements instead of two.
+    assert [value_groups(sql) for sql, _ in cursor.inserts] == [2, 2, 2, 1]
+    for _, params in cursor.inserts:
+        assert len(params) % ROW_WIDTH == 0
+        assert sum(len(value) for value in params if isinstance(value, str)) <= _common.INSERT_CHUNK_CHARS
+
+
 def test_insert_binds_values_instead_of_interpolating_them() -> None:
     cursor = FakeCursor()
     row = raw_row(
