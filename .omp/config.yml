@@ -4,55 +4,56 @@
 #
 #   job_postings/.omp/{mcp.json,config.yml,RULES.md}    -> ../../.omp/...
 #   reddit_pipeline/.omp/{mcp.json,config.yml,RULES.md} -> ../../.omp/...
-#   wikimedia/.omp/{mcp.json,config.yml,RULES.md}       -> ../../.omp/...
+#   kafka_streams/.omp/{mcp.json,config.yml,RULES.md}   -> ../../.omp/...
 #
 # RULES.md needs its own link even though it is not a settings file: native
 # sticky-rule discovery stops at the nearest non-empty `.omp/`, so from inside a
 # project directory the root `.omp/RULES.md` alone would not load. A new
 # subproject that gains a non-empty `.omp/` needs all three links, or the rule
 # silently disappears there. A directory with no `.omp/` gets neither the rules
-# nor the MCP server — OMP does not walk ancestors — so `wikimedia/` carries
+# nor the MCP server — OMP does not walk ancestors — so `kafka_streams/` carries
 # the same three links rather than inheriting them.
 #
 # Keep the definitions at the checkout root; edit them once and all three
 # projects pick the change up.
 #
-# One governed read-only Databricks SQL MCP service (Unity Gateway):
+# One Databricks SQL MCP service, `system.ai.dbsql` — Databricks' own, on the
+# Express-trial workspace `dbc-280fcd4a-642e.cloud.databricks.com`. It advertises
+# `execute_sql` and `poll_sql_result`, and `execute_sql` is capable of writes.
 #
-#   databricks  workspace.reddit.dbsql_read_only
-#               execute_sql_read_only, poll_sql_result
-#               runs as service principal `omp-dbsql-ro`
+# The read-only guarantee is therefore the caller's identity, not a tool name:
 #
-# Its service principal holds USE_CATALOG on workspace plus USE_SCHEMA and
-# SELECT ON SCHEMA for all four schemas (job_postings, reddit, topic_raw,
-# wikimedia), granted 2026-10-18, so `job_postings` is queried through this
-# server too and dbt-created relations stay readable without re-granting. With a
-# single server there is no schema routing to enforce; narrow the grants if the
-# boundary matters.
+#   1. `.omp/mcp.json` sends `Authorization: Bearer <token>` for the service
+#      principal `omp-dbsql-ro` (applicationId 2848e97e-e449-400f-9088-c33275d535d0).
+#      The header is produced per connection by `~/.config/omp/dbsql-token.py`,
+#      which mints an OAuth M2M token (client_credentials, scope `all-apis`) from
+#      the client secret in `~/.config/omp/dbsql-client.json` (mode 600, expires
+#      2028-10-23) and caches it in `~/.config/omp/.dbsql-token-cache` for its
+#      one-hour life. It is not the caller's identity, so no human token reaches
+#      the server.
+#   2. That principal holds exactly: USE_CATALOG on `workspace`; USE_SCHEMA and
+#      SELECT on `workspace.job_postings`, `workspace.reddit`,
+#      `workspace.topic_raw`; CAN_USE on warehouse `5c5d597ca7af9460`. It has no
+#      CREATE/INSERT/UPDATE/DELETE/MODIFY anywhere, so a write fails in Unity
+#      Catalog with `PERMISSION_DENIED`, whatever the MCP tool set allows.
+#      `system` and `system.ai` access is inherited from its `account users`
+#      membership — the workspace user is not a metastore admin and cannot grant
+#      on the `system` catalog directly.
+#   3. What used to be a third layer here — a `tools.approval` deny on
+#      `mcp__databricks_execute_sql` — is deliberately gone. On the retired
+#      server it denied the write tool while `execute_sql_read_only` stayed
+#      callable. `system.ai.dbsql` has no read-only variant, so the same deny now
+#      blocks the only SQL tool and leaves MCP unusable, which is not a safety
+#      property. Layer 2 is the boundary; `RULES.md` keeps the write gate for the
+#      fallback identity, which is where writes can actually happen.
 #
-# It is called with the caller's own Databricks identity resolved per request
-# by `databricks auth token`, so callers still need EXECUTE on the MCP and
-# USE CATALOG/USE SCHEMA on its parents. The data access is the connection's
-# service principal, not the caller.
+# A write attempted through MCP does not surface as an HTTP error. `execute_sql`
+# returns HTTP 200 with a body whose `status.state` is `FAILED`, `error_code`
+# `BAD_REQUEST`, `sql_state` `42501`, and a `PERMISSION_DENIED: Principal
+# 'omp-dbsql-ro' does not have ...` message; `isError` stays `false`. Read the
+# body, not the status code.
 #
-# Writes are impossible at three independent layers, none of which live in an
-# MCP client's config:
-#   1. the service's `config.include_tool_selectors` omits any write tool, so
-#      `execute_sql` is absent from tools/list and a call to it returns
-#      "Tool not allowed by MCP service configuration";
-#   2. `execute_sql_read_only` runs in a genuine read-only DBSQL session, so a
-#      persistent write fails with [OP_NOT_SUPPORTED_READ_ONLY]. Session-local
-#      `CREATE TEMPORARY VIEW` is accepted and disappears with the session;
-#      nothing persistent is written.
-#   3. the connection authenticates as the service principal above, which holds
-#      SELECT only — no write privilege — on all four schemas.
-#
-# The approval rule below is belt-and-braces for the OMP client specifically: it
-# blocks a write-capable `execute_sql` tool outright should the endpoint ever
-# advertise one. `tools.approval` is absolute — a user `deny` is honored in every
-# approval mode, including `yolo`, so the agent cannot bypass it. The governed
-# service does not expose `execute_sql`, so the rule only fires if the endpoint
-# URL above is repointed at a write-capable server.
-tools:
-  approval:
-    mcp__databricks_execute_sql: deny
+# The fallback identity is different: the Databricks user `ak547276@gmail.com`
+# (CLI profile `DEFAULT`) owns every schema in `workspace` and can write. That is
+# why `RULES.md` gates writes absolutely rather than relying on this server.
+

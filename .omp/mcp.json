@@ -3,10 +3,10 @@
   "mcpServers": {
     "databricks": {
       "type": "http",
-      "url": "https://dbc-180d6d5c-8ac3.cloud.databricks.com/ai-gateway/mcp-services/workspace.reddit.dbsql_read_only",
+      "url": "https://dbc-280fcd4a-642e.cloud.databricks.com/ai-gateway/mcp-services/system.ai.dbsql",
       "timeout": 120000,
       "headers": {
-        "Authorization": "!databricks auth token --profile DEFAULT | python3 -c \"import sys,json;print('Bearer '+json.load(sys.stdin)['access_token'])\""
+        "Authorization": "!$HOME/.config/omp/dbsql-token.py"
       }
     }
   }
