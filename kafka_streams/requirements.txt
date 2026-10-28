@@ -1,0 +1,13 @@
+# Runtime dependencies shared by every flow under kafka_streams/.
+#   pip install -r requirements.txt
+#
+#   confluent-kafka  -> producer/consumer client (librdkafka)
+#   requests         -> HTTP bridges that read an upstream stream
+#   websockets       -> WebSocket bridges (bluesky flow)
+#   python-dotenv    -> import dotenv  (.env loading)
+#
+# sqlite3 is in the standard library; there is no database driver to install.
+confluent-kafka==2.16.0
+requests==2.34.2
+websockets==17.2
+python-dotenv==1.2.4

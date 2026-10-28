@@ -1,0 +1,27 @@
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+# `.flink-venv` holds PyFlink for `wikimedia/`; it is a separate environment
+# (Flink pins protobuf<6, dbt needs protobuf>=6) and is not this project's source.
+extend-exclude = ["data", "**/data", ".state", "**/.state", ".flink-venv"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+]
+
+[tool.pyright]
+# Match the ruff target so both tools agree on the supported language level.
+pythonVersion = "3.10"
+exclude = ["data", "**/data", ".state", "**/.state", ".flink-venv", ".ruff_cache", ".pytest_cache", "__pycache__"]
+# Runtime deps (confluent-kafka, requests, python-dotenv) live in
+# requirements.txt. reportMissingImports stays enabled rather than silenced: on a
+# checkout where they are not installed it is the signal that the environment is
+# incomplete.

@@ -1,0 +1,4 @@
+# Flink connector jars are fetched by fetch-jars.sh (or built by
+# build-sqlite-dialect.sh), not committed: 23 MB of binary per version is not
+# something a diff should carry.
+*.jar

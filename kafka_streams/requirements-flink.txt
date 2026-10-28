@@ -1,0 +1,12 @@
+# PyFlink runtime, installed into `.flink-venv` - never into the repo's `.venv`.
+#   python -m venv .flink-venv && .flink-venv/bin/pip install -r requirements-flink.txt
+#
+# PyFlink pins its own protobuf (`apache-beam` requires `protobuf<6`), while dbt
+# requires `protobuf>=6`; one environment cannot hold both, and installing this
+# file into `.venv` downgrades protobuf and breaks the dbt projects.
+#
+# Flink 2.x is the first line with cp312 wheels; 2.2.0 matches the connector
+# jars pinned in <flow>/lib/fetch-jars.sh (one copy per flow).
+apache-flink==2.2.0
+confluent-kafka==2.16.0
+python-dotenv==1.2.4

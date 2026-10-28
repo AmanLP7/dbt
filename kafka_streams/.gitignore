@@ -1,0 +1,12 @@
+# Local secrets / machine-specific config, shared by every flow
+.env
+
+# Flow data: SQLite databases, WAL sidecars, and per-flow state
+**/data/
+**/.state/
+
+# Python / lint tooling caches
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/

@@ -1,5 +1,7 @@
-# Virtual environment
+# Virtual environments. `.flink-venv` is PyFlink's, kept apart because Flink
+# pins protobuf<6 while dbt needs protobuf>=6.
 .venv/
+.flink-venv/
 venv/
 
 # dbt logs and compiled target files
@@ -11,4 +13,11 @@ dbt_readme.md
 
 # Throwaway DAGSTER_HOME directories created by `dagster dev` and the test suite
 .tmp_dagster_home_*/
+
+# Persistent DAGSTER_HOME used when serving both code locations from one server
+.dagster_home/
+
+# Symlinks into ~/.databricks/aitools/skills, installed per machine by
+# `databricks aitools install --path`. Absolute targets, so never committed.
+.agents/skills/databricks-*
 
