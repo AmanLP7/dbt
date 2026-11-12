@@ -34,9 +34,9 @@ models:
 
   - name: mart_comment_history
     description: >
-      Comment-grain history combining r_comments with its r_worldnews post context.
-      Incremental merge on comment_id, restricted to the last 5 hours to mirror the
-      ingestion rolling window.
+      Comment-grain history combining r_comments with its r_posts post context.
+      Incremental merge on comment_id, restricted to the last 26 hours to mirror the
+      ingestion read window.
     columns:
       - name: comment_id
         description: "The unique identifier of the comment (grain of this model)"
@@ -44,11 +44,11 @@ models:
           - unique
           - not_null
       - name: post_id
-        description: "The id of the r_worldnews post the comment belongs to"
+        description: "The id of the r_posts post the comment belongs to"
         tests:
           - not_null
           # Referential integrity is not guaranteed by the ingestion window: a
-          # comment can be loaded for a post that is absent from r_worldnews
+          # comment can be loaded for a post that is absent from r_posts
           # (the post aged out or was not re-fetched while its comments were).
           # Warn rather than fail so the gap stays visible.
           - relationships:
@@ -58,7 +58,7 @@ models:
               config:
                 severity: warn
       - name: comment_created_at
-        description: "Comment creation time; drives the 5-hour incremental window"
+        description: "Comment creation time; drives the 26-hour incremental window"
         tests:
           - not_null
       - name: rec_updated_at

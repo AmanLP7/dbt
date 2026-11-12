@@ -78,11 +78,11 @@ why the rolling-window constant is a macro rather than a dbt var — a `var()` i
 
 **Rule deviations are intentional, not drift.**
 
-- `aliasing.table = implicit` — all 12 aliased table references across the 5
-  non-staging models use implicit aliases (`from posts p`). Flipping to the
-  default `explicit` means editing those 5 models.
+- `aliasing.table = implicit` — every aliased table reference outside `models/staging/`
+  uses an implicit alias (`from posts p`). Flipping to the default `explicit` means
+  rewriting every one of those models.
 - `references.keywords` ignores `source, users, title`. None are reserved in the
-  Databricks dialect; `title` is a raw column of `r_worldnews` that propagates
+  Databricks dialect; `title` is a raw column of `r_posts` that propagates
   into marts, so renaming it would change the output schema.
 - Capitalisation rules are pinned to lower case to match the existing models.
 

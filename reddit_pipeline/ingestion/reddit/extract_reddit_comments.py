@@ -1,25 +1,31 @@
-"""Fetch hot r/worldnews posts with their top comments and load them into Databricks.
+"""Fetch the top comments of the run's most-discussed posts into Databricks.
 
 Importing this module only loads environment variables; all Reddit API and
 Databricks work happens inside :func:`extract_comments`, so the module stays
 importable and runnable (`python -m ingestion.reddit.extract_reddit_comments`).
 """
 
+import datetime
+from typing import Any
+
 from ingestion.reddit._common import (
+    COMMENT_POST_LIMIT,
     COMMENTS_COLUMNS,
     COMMENTS_PER_POST,
     INCREMENTAL_WINDOW_HOURS,
-    POSTS_LIMIT,
-    SUBREDDIT,
+    Submission,
     configure_logging,
     connect,
     ensure_columns,
     ensure_table,
     full_table,
+    harvest_submissions,
     load_timestamp,
     logger,
     reddit_client,
-    replace_window,
+    replace_by_key,
+    row_values,
+    subreddit_list,
     validate_env,
     window_cutoff,
 )
@@ -27,11 +33,37 @@ from ingestion.reddit._common import (
 TABLE = full_table("r_comments")
 
 
+def _comment_rows(submission: Submission, stamped_at: datetime.datetime) -> list[dict[str, Any]]:
+    """The raw comment rows of one post, in `COMMENTS_COLUMNS`' own vocabulary.
+
+    The subreddit is taken from the submission rather than from the comment: a
+    comment carries no subreddit field of its own, and the post it hangs off is
+    the only thing that knows which section the discussion belongs to.
+    """
+    # Resolve the comment forest without expanding "more" stubs
+    submission.comments.replace_more(limit=0)
+    return [
+        {
+            "id": comment.id,
+            "post_id": submission.id,
+            "body": comment.body if comment.body else "",
+            "score": int(comment.score),
+            "author": str(comment.author) if comment.author else "[deleted]",
+            "created_utc": float(comment.created_utc),
+            "parent_id": comment.parent_id,
+            "subreddit": str(submission.subreddit).lower(),
+            "ingested_at": stamped_at,
+        }
+        for comment in submission.comments[:COMMENTS_PER_POST]
+    ]
+
+
 def extract_comments() -> int:
-    """Extract the top comments of the hot r/worldnews posts into Databricks.
+    """Extract the top comments of the busiest posts in the window into Databricks.
 
     Returns the number of comment rows written: those fetched inside the rolling
-    window. Rows outside the window are left untouched.
+    window. Rows outside the window are ignored, and rows the table already holds
+    for a fetched id are replaced.
     """
     validate_env()
 
@@ -41,25 +73,28 @@ def extract_comments() -> int:
     logger.info("Initializing Reddit API client...")
     reddit = reddit_client()
 
-    logger.info("Fetching hot posts from r/%s and their comments...", SUBREDDIT)
-    subreddit = reddit.subreddit(SUBREDDIT)
-    comments = []
-    for submission in subreddit.hot(limit=POSTS_LIMIT):
+    names = subreddit_list()
+    logger.info("Fetching new and top-of-day posts from %d subreddits...", len(names))
+    submissions, failed = harvest_submissions(reddit, names)
+    # Comment fetching is one request per post, so it is aimed at the posts whose
+    # discussion is actually worth having, not at whatever order the listings
+    # returned: by comment count, inside the window only.
+    window = [submission for submission in submissions if submission.created_utc >= cutoff]
+    window.sort(key=lambda submission: submission.num_comments, reverse=True)
+    targets = window[:COMMENT_POST_LIMIT]
+    logger.info(
+        "Selected %d of %d in-window posts across %d subreddits (%d unreadable) for comment fetching.",
+        len(targets),
+        len(window),
+        len(names) - len(failed),
+        len(failed),
+    )
+
+    stamped_at = load_timestamp()
+    comments: list[dict[str, Any]] = []
+    for submission in targets:
         logger.debug("Fetching comments for post: %s...", submission.title[:50])
-        # Resolve the comment forest without expanding "more" stubs
-        submission.comments.replace_more(limit=0)
-        for comment in submission.comments[:COMMENTS_PER_POST]:
-            comments.append(
-                {
-                    "id": comment.id,
-                    "post_id": submission.id,
-                    "body": comment.body if comment.body else "",
-                    "score": int(comment.score),
-                    "author": str(comment.author) if comment.author else "[deleted]",
-                    "created_utc": float(comment.created_utc),
-                    "parent_id": comment.parent_id,
-                }
-            )
+        comments.extend(_comment_rows(submission, stamped_at))
     logger.info("Successfully fetched %d comments.", len(comments))
 
     fetched_count = len(comments)
@@ -71,21 +106,7 @@ def extract_comments() -> int:
         INCREMENTAL_WINDOW_HOURS,
     )
 
-    # One load-time timestamp for every row of this run
-    stamped_at = load_timestamp()
-    rows = [
-        (
-            comment["id"],
-            comment["post_id"],
-            comment["body"],
-            comment["score"],
-            comment["author"],
-            comment["created_utc"],
-            comment["parent_id"],
-            stamped_at,
-        )
-        for comment in comments
-    ]
+    rows = [row_values(COMMENTS_COLUMNS, comment) for comment in comments]
 
     logger.info("Connecting to Databricks...")
     connection, cursor = connect()
@@ -93,7 +114,7 @@ def extract_comments() -> int:
         ensure_table(cursor, TABLE, COMMENTS_COLUMNS)
         ensure_columns(cursor, TABLE, COMMENTS_COLUMNS)
         logger.info("Ingesting data into %s...", TABLE)
-        written = replace_window(cursor, TABLE, COMMENTS_COLUMNS, rows, "created_utc", cutoff)
+        written = replace_by_key(cursor, TABLE, COMMENTS_COLUMNS, rows, "id")
         logger.info("Comment data ingestion complete: %d comments written.", written)
     finally:
         cursor.close()

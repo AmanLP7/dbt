@@ -2,14 +2,19 @@
 
 Four tasks, in dependency order:
 
-1. ``raw_reddit_posts`` (Python) — fetch the hot r/worldnews posts into
-   ``workspace.topic_raw.r_worldnews``.
-2. ``raw_reddit_comments`` (Python) — fetch their top comments into
-   ``workspace.topic_raw.r_comments``.
+1. ``raw_reddit_posts`` (Python) — fetch the new and top-of-day posts of every
+   subreddit in ``seeds/sections.csv`` into ``workspace.topic_raw.r_posts``.
+2. ``raw_reddit_comments`` (Python) — fetch the top comments of the most-commented
+   in-window posts into ``workspace.topic_raw.r_comments``.
 3. ``raw_reddit_users`` (Python) — fetch post/comment authors into
    ``workspace.topic_raw.r_users``.
 4. ``dbt_reddit`` (dbt) — one ``dbt build``: staging, intermediate, marts and their
    tests.
+
+The job runs on demand and, once someone starts it in the UI, on
+``daily_edition_refresh`` (05:00 UTC). The ``daily`` mart layer it feeds is
+incremental on ``edition_date``, so each day's paper is written once and every older
+edition stays readable after the raw tables roll.
 
 Each extractor asset carries the asset key Dagster derives for its dbt source
 (``<source_name>/<table_name>``), so the Python asset and the dbt source spec merge:
@@ -106,15 +111,15 @@ if not DBT_PROJECT.manifest_path.exists() and DBT_PROJECT.preparer is not None:
     # Parsing here costs nothing once target/ exists.
     DBT_PROJECT.preparer.prepare(DBT_PROJECT)
 
-RAW_POSTS_KEY = dg.AssetKey(["reddit_raw", "r_worldnews"])
+RAW_POSTS_KEY = dg.AssetKey(["reddit_raw", "r_posts"])
 RAW_COMMENTS_KEY = dg.AssetKey(["reddit_raw", "r_comments"])
 RAW_USERS_KEY = dg.AssetKey(["reddit_raw", "r_users"])
 
 
-# dbt's tests become Dagster asset checks: the 28 declared on models attach to their
-# model automatically. Source tests, if any are added to src_reddit.yml, attach to the
-# extractor assets only when `enable_source_tests_as_checks` is set, which is what makes
-# the extractor's `source` values a checked contract rather than a guess.
+# dbt's tests become Dagster asset checks: every test declared on a model or a seed
+# attaches to that node automatically. Source tests, if any are added to src_reddit.yml,
+# attach to the extractor assets only when `enable_source_tests_as_checks` is set, which
+# is what makes the extractor's `source` values a checked contract rather than a guess.
 #
 # The group is set here rather than in dbt_project.yml because dbt's own `group:`
 # config requires a matching `groups:` entry in a dbt-side YAML file, which would add
@@ -156,13 +161,13 @@ RETRY_POLICY = dg.RetryPolicy(
     kinds={"python", "databricks"},
     retry_policy=RETRY_POLICY,
     description=(
-        "Hot r/worldnews posts inside the rolling five-hour window, appended to "
-        "workspace.topic_raw.r_worldnews. Comments and users load from the same hot "
-        "posts, so this runs first."
+        "The new and top-of-day listings of every seeded subreddit, filtered to the "
+        "26-hour read window and upserted by post id into workspace.topic_raw.r_posts. "
+        "Comments and users load from the same posts, so this runs first."
     ),
 )
 def raw_reddit_posts(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
-    """Task 1: fetch the hot posts and load the rolling window."""
+    """Task 1: fetch every seeded subreddit's listings and upsert the posts."""
     rows_written = extract_posts()
     context.log.info("Wrote %s posts", rows_written)
     return dg.MaterializeResult(metadata={"rows_written": rows_written})
@@ -175,11 +180,12 @@ def raw_reddit_posts(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     kinds={"python", "databricks"},
     retry_policy=RETRY_POLICY,
     description=(
-        "Top comments of the hot posts inside the rolling five-hour window, appended to workspace.topic_raw.r_comments."
+        "Top comments of the 200 most-commented in-window posts, upserted by comment id "
+        "into workspace.topic_raw.r_comments."
     ),
 )
 def raw_reddit_comments(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
-    """Task 2: fetch the hot posts' comments and load the rolling window."""
+    """Task 2: fetch the most-commented posts' comments and upsert them."""
     rows_written = extract_comments()
     context.log.info("Wrote %s comments", rows_written)
     return dg.MaterializeResult(metadata={"rows_written": rows_written})
@@ -197,7 +203,7 @@ def raw_reddit_comments(context: dg.AssetExecutionContext) -> dg.MaterializeResu
     ),
 )
 def raw_reddit_users(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
-    """Task 3: collect the hot posts' authors and upsert their profiles."""
+    """Task 3: collect the post and comment authors across the seed and upsert them."""
     rows_written = extract_users()
     context.log.info("Wrote %s users", rows_written)
     return dg.MaterializeResult(metadata={"rows_written": rows_written})
@@ -223,10 +229,23 @@ reddit_refresh = dg.define_asset_job(
     description="Land the posts, comments and users, then rebuild and test the models.",
 )
 
-# No schedule: the Prefect deployment shipped on-demand only, so the port keeps runs
-# manual. Add a ScheduleDefinition (shipped stopped) here when cadence is decided.
+# The edition runs once a day, not on every extractor run: the daily marts are
+# incremental on `edition_date`, so a second build inside the same day replaces that
+# day's page rather than adding to it, and the app reads one stable snapshot.
+# 05:00 UTC is after the American evening and before the European morning, so the
+# widest set of the previous day's stories has been posted by the time it builds.
+# Created stopped, matching `daily_job_board_refresh` in the sibling project: a
+# deployment does not write to the warehouse until someone flips it in the UI.
+daily_edition_refresh = dg.ScheduleDefinition(
+    name="daily_edition_refresh",
+    job=reddit_refresh,
+    cron_schedule="0 5 * * *",
+    default_status=dg.DefaultScheduleStatus.STOPPED,
+)
+
 defs = dg.Definitions(
     assets=[raw_reddit_posts, raw_reddit_comments, raw_reddit_users, dbt_reddit],
     resources={"dbt": DbtCliResource(project_dir=DBT_PROJECT)},
     jobs=[reddit_refresh],
+    schedules=[daily_edition_refresh],
 )

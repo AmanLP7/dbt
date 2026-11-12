@@ -3,8 +3,8 @@
 `definitions.py` is the only place the two halves of the pipeline meet: each Python
 asset carries the key Dagster derives for its `reddit_raw.r_*` dbt source, so the source
 specs merge into the extractors and the staging models depend on the loads. Nothing else
-in the repo pins that merge, the 28 model tests the translator turns into asset checks, or
-the job's selection, so a renamed key or a flipped translator default could cut the
+in the repo pins that merge, the tests the translator turns into asset checks, or the
+job's selection, so a renamed key or a flipped translator default could cut the
 extractors out of a run while every other test still passed. These assertions are
 offline: they read the resolved graph, never a warehouse or the network.
 """
@@ -38,8 +38,16 @@ MODEL_KEYS = {
     "mart_post_summary",
     "mart_user_metrics",
     "mart_comment_history",
+    "mart_daily_edition",
+    "mart_daily_section_summary",
+    "mart_daily_trending_terms",
+    "mart_daily_reading_list",
+    "mart_subreddit_daily_volume",
 }
-ASSET_KEYS = EXTRACTOR_KEYS | MODEL_KEYS
+# Seeds are assets too: they are built by the same `dbt build`, and the daily marts
+# join against them, so the graph must show them upstream of the models.
+SEED_KEYS = {"sections", "trending_stopwords"}
+ASSET_KEYS = EXTRACTOR_KEYS | MODEL_KEYS | SEED_KEYS
 
 
 def user_keys(asset_keys: Iterable[dg.AssetKey]) -> set[str]:
@@ -51,7 +59,7 @@ def dep_keys(spec: dg.AssetSpec) -> set[str]:
     return user_keys(dep.asset_key for dep in spec.deps)
 
 
-def test_the_pipeline_is_three_python_extractors_and_eight_dbt_models() -> None:
+def test_the_pipeline_is_three_python_extractors_thirteen_dbt_models_and_two_seeds() -> None:
     assert set(SPECS) == ASSET_KEYS
 
     for key in EXTRACTOR_KEYS:
@@ -96,8 +104,8 @@ def test_every_extractor_is_an_ancestor_of_the_comment_history_mart() -> None:
     assert "mart_comment_history" not in ancestors
 
 
-def test_the_twenty_eight_model_tests_become_asset_checks() -> None:
-    assert len(GRAPH.asset_check_keys) == 28
+def test_every_declared_test_becomes_an_asset_check() -> None:
+    assert len(GRAPH.asset_check_keys) == 70
 
     # The source declarations carry no tests, so no check attaches to an extractor.
     for key in (POSTS, COMMENTS, USERS):
@@ -108,10 +116,20 @@ def test_the_job_selects_every_asset() -> None:
     assert user_keys(d.reddit_refresh.selection.resolve(GRAPH)) == ASSET_KEYS
 
 
-def test_no_schedule_ships_with_the_port() -> None:
-    # Prefect was triggered on demand, so the port keeps that: no schedule until a
-    # cadence is decided, and nothing writes to the warehouse by itself.
-    assert list(d.defs.schedules or []) == []
+def test_the_only_schedule_is_the_daily_edition_and_it_ships_stopped() -> None:
+    # Exactly one schedule, on the daily edition, and stopped: a deployment must not
+    # start writing to the warehouse until someone flips it in the UI.
+    schedules = list(d.defs.schedules or [])
+    assert [schedule.name for schedule in schedules] == ["daily_edition_refresh"]
+
+    schedule = schedules[0]
+    # `defs.schedules` is a union of schedule kinds; the cron attributes only exist on
+    # the plain one, which is what a non-partitioned job gets. Narrowing here is what
+    # makes the assertions below type-check.
+    assert isinstance(schedule, dg.ScheduleDefinition)
+    assert schedule.cron_schedule == "0 5 * * *"
+    assert schedule.default_status == dg.DefaultScheduleStatus.STOPPED
+    assert schedule.job_name == "reddit_refresh"
 
 
 def test_the_python_and_dbt_steps_carry_a_retry_policy() -> None:

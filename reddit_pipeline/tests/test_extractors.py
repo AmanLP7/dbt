@@ -18,7 +18,7 @@ pytestmark = pytest.mark.usefixtures("env", "clock")
 HOUR = 3600
 INSIDE = NOW - HOUR
 OUTSIDE = NOW - (WINDOW + 1) * HOUR
-POSTS_TABLE = _common.full_table("r_worldnews")
+POSTS_TABLE = _common.full_table("r_posts")
 COMMENTS_TABLE = _common.full_table("r_comments")
 USERS_TABLE = _common.full_table("r_users")
 
@@ -33,10 +33,68 @@ def test_posts_loads_only_rows_inside_the_window(warehouse, wire_reddit):
     assert written == 1
     rows = warehouse.inserted(_common.POSTS_COLUMNS)
     assert [row[0] for row in rows] == ["fresh"]
-    # The window is enforced by the DELETE, bound as a parameter, not interpolated.
+    # The load is an upsert on the fetched ids, not a window rewrite: two runs
+    # cover different spans of the same day, so a time-based delete would drop
+    # rows the run never refetched.
     delete_sql, params = warehouse.deletes[0]
     assert delete_sql.startswith(f"DELETE FROM {POSTS_TABLE}")
-    assert params == (NOW - WINDOW * HOUR,)
+    assert params == ("fresh",)
+
+
+def test_a_post_seen_in_both_listings_is_written_once(warehouse, wire_reddit):
+    post = FakeSubmission("p1", created_utc=INSIDE)
+    fake = wire_reddit(FakeSubreddit([post], top=[post]))
+
+    written = extract_posts()
+
+    assert written == 1
+    assert [row[0] for row in warehouse.inserted(_common.POSTS_COLUMNS)] == ["p1"]
+    # `top` without a day filter is an all-time top 100: the 26-hour read filter
+    # would then discard nearly all of it, silently, and the "already earned its
+    # place" half of the harvest would stop contributing.
+    assert fake.served("worldnews").top_time_filter == _common.TOP_TIME_FILTER
+
+
+def test_each_row_carries_its_own_subreddit(warehouse, wire_reddit):
+    # The edition's section map joins on this column, so a row that inherited the
+    # first subreddit fetched would print under the wrong section.
+    wire_reddit(
+        FakeSubreddit([FakeSubmission("p1", created_utc=INSIDE, subreddit="technology")], name="technology"),
+        name="technology",
+    )
+
+    extract_posts()
+
+    rows = warehouse.inserted(_common.POSTS_COLUMNS)
+    subreddit_index = list(_common.POSTS_COLUMNS).index("subreddit")
+    assert {row[subreddit_index] for row in rows} == {"technology"}
+
+
+def test_an_unreadable_subreddit_is_reported_and_skipped(warehouse, wire_reddit, caplog):
+    # Two of the seed's subreddits fail to read; the third still loads.
+    wire_reddit(
+        FakeSubreddit([FakeSubmission("p1", created_utc=INSIDE, subreddit="technology")], name="technology"),
+        name="technology",
+        unreadable=("worldnews", "politics"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        written = extract_posts()
+
+    assert written == 1  # the readable subreddit still loaded
+    warnings = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+    assert any("r/worldnews" in message for message in warnings)
+    assert any("r/politics" in message for message in warnings)
+
+
+def test_the_seed_is_the_only_list_of_subreddits():
+    # Adding a subreddit must stay a one-file data change, and the ingest must not
+    # drift from the seed the marts join on.
+    names = _common.subreddit_list()
+
+    assert len(names) == len(set(names)), "a duplicated seed row would double every request"
+    assert "worldnews" in names and "askreddit" in names
+    assert all(name == name.lower() for name in names)
 
 
 def test_posts_writes_the_ingest_timestamp_on_every_row(warehouse, wire_reddit):

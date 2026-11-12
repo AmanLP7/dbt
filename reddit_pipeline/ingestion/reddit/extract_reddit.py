@@ -1,36 +1,58 @@
-"""Extract hot posts from r/worldnews and load them into Databricks.
+"""Extract posts from every subreddit in the section seed and load them into Databricks.
 
 Importing this module only loads environment variables; all Reddit API and
 Databricks work happens inside :func:`extract_posts`, so the module stays
 importable and runnable (`python -m ingestion.reddit.extract_reddit`).
 """
 
+import datetime
+from typing import Any
+
 from ingestion.reddit._common import (
     INCREMENTAL_WINDOW_HOURS,
     POSTS_COLUMNS,
-    POSTS_LIMIT,
-    SUBREDDIT,
+    Submission,
     configure_logging,
     connect,
     ensure_columns,
     ensure_table,
     full_table,
+    harvest_submissions,
     load_timestamp,
     logger,
     reddit_client,
-    replace_window,
+    replace_by_key,
+    row_values,
+    subreddit_list,
     validate_env,
     window_cutoff,
 )
 
-TABLE = full_table("r_worldnews")
+TABLE = full_table("r_posts")
+
+
+def _record(submission: Submission, stamped_at: datetime.datetime) -> dict[str, Any]:
+    """One raw post row, in `POSTS_COLUMNS`' own vocabulary."""
+    return {
+        "id": submission.id,
+        "title": submission.title,
+        "score": int(submission.score),
+        "url": submission.url,
+        "comms_num": int(submission.num_comments),
+        "created_utc": float(submission.created_utc),
+        "body": submission.selftext if submission.selftext else "",
+        "author": str(submission.author) if submission.author else "[deleted]",
+        "subreddit": str(submission.subreddit).lower(),
+        "ingested_at": stamped_at,
+    }
 
 
 def extract_posts() -> int:
-    """Fetch the hot r/worldnews posts and load them into Databricks.
+    """Fetch posts from every subreddit in the seed and load them into Databricks.
 
     Returns the number of post rows written: those fetched inside the rolling
-    window. Rows outside the window are left untouched.
+    window. Rows outside the window are ignored, and rows the table already holds
+    for a fetched id are replaced.
     """
     validate_env()
 
@@ -40,51 +62,29 @@ def extract_posts() -> int:
     logger.info("Initializing Reddit API client...")
     reddit = reddit_client()
 
-    logger.info("Fetching hot posts from r/%s...", SUBREDDIT)
-    subreddit = reddit.subreddit(SUBREDDIT)
-    posts = [
-        {
-            "id": submission.id,
-            "title": submission.title,
-            "score": int(submission.score),
-            "url": submission.url,
-            "comms_num": int(submission.num_comments),
-            "created_utc": float(submission.created_utc),
-            "body": submission.selftext if submission.selftext else "",
-            "author": str(submission.author) if submission.author else "[deleted]",
-            "subreddit": SUBREDDIT,
-        }
-        for submission in subreddit.hot(limit=POSTS_LIMIT)
-    ]
-    logger.info("Successfully fetched %d posts.", len(posts))
+    names = subreddit_list()
+    logger.info("Fetching new and top-of-day posts from %d subreddits...", len(names))
+    submissions, failed = harvest_submissions(reddit, names)
+    logger.info(
+        "Fetched %d distinct posts from %d subreddits; %d subreddits unreadable.",
+        len(submissions),
+        len(names) - len(failed),
+        len(failed),
+    )
 
-    # Keep only posts inside the rolling window
-    fetched_count = len(posts)
-    posts = [post for post in posts if post["created_utc"] >= cutoff]
+    # Keep only posts inside the read window
+    fetched_count = len(submissions)
+    submissions = [submission for submission in submissions if submission.created_utc >= cutoff]
     logger.info(
         "Fetched %d posts; kept %d within the last %sh window.",
         fetched_count,
-        len(posts),
+        len(submissions),
         INCREMENTAL_WINDOW_HOURS,
     )
 
     # One load-time timestamp for every row of this run
     stamped_at = load_timestamp()
-    rows = [
-        (
-            post["id"],
-            post["title"],
-            post["score"],
-            post["url"],
-            post["comms_num"],
-            post["created_utc"],
-            post["body"],
-            post["author"],
-            post["subreddit"],
-            stamped_at,
-        )
-        for post in posts
-    ]
+    rows = [row_values(POSTS_COLUMNS, _record(submission, stamped_at)) for submission in submissions]
 
     logger.info("Connecting to Databricks...")
     connection, cursor = connect()
@@ -92,7 +92,7 @@ def extract_posts() -> int:
         ensure_table(cursor, TABLE, POSTS_COLUMNS)
         ensure_columns(cursor, TABLE, POSTS_COLUMNS)
         logger.info("Ingesting data into %s...", TABLE)
-        written = replace_window(cursor, TABLE, POSTS_COLUMNS, rows, "created_utc", cutoff)
+        written = replace_by_key(cursor, TABLE, POSTS_COLUMNS, rows, "id")
         logger.info("Data ingestion complete: %d posts written.", written)
     finally:
         cursor.close()

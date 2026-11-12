@@ -2,7 +2,7 @@ version: 2
 
 models:
   - name: stg_reddit_posts
-    description: "Cleaned and deduplicated posts from r/worldnews"
+    description: "Cleaned and deduplicated posts from every seeded subreddit"
     columns:
       - name: post_id
         description: "The unique identifier of the post"
@@ -24,7 +24,11 @@ models:
                 severity: warn
 
   - name: stg_reddit_comments
-    description: "Cleaned and deduplicated comments from r/worldnews posts"
+    description: >
+      Cleaned and deduplicated comments, newest row per comment id. The parent
+      post's subreddit is deliberately not selected here: `mart_comment_history`
+      takes it from `stg_reddit_posts`, so one join keeps the edition's section
+      map reading a single subreddit column.
     columns:
       - name: comment_id
         description: "The unique identifier of the comment"
@@ -36,7 +40,7 @@ models:
         tests:
           - not_null
           # Referential integrity is not guaranteed by the ingestion window: a
-          # comment can be loaded for a post that is absent from r_worldnews (the
+          # comment can be loaded for a post that is absent from r_posts (the
           # post aged out or was not re-fetched while its comments were). Warn
           # rather than fail so the gap stays visible.
           - relationships:

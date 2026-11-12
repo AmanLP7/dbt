@@ -1,0 +1,48 @@
+version: 2
+
+seeds:
+  - name: sections
+    description: >
+      Maps each ingested subreddit to the newspaper section it prints under. A
+      subreddit absent from this seed still appears in the edition, under `other`;
+      this file decides the front page's shape, not whether a subreddit is ingested.
+      The `weight` column is reserved ranking input that no model reads yet —
+      `mart_daily_edition` orders by engagement, then post id.
+    columns:
+      - name: subreddit
+        description: "Lower-case subreddit name, matching lower(stg_reddit_posts.subreddit)"
+        tests:
+          - unique
+          - not_null
+      - name: section
+        description: "Newspaper section: world, politics, business, tech, science, sports, culture, discussion"
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values:
+                  - world
+                  - politics
+                  - business
+                  - tech
+                  - science
+                  - sports
+                  - culture
+                  - discussion
+      - name: weight
+        description: "Relative importance of the subreddit inside its section, 0–1"
+        tests:
+          - not_null
+
+  - name: trending_stopwords
+    description: >
+      Words removed from story titles before the trending-terms mart counts them.
+      Grammar and news furniture only: a term that is on every front page every day
+      has no trend to report, and keeping it would push the real subjects out of the
+      top of the list.
+    columns:
+      - name: stopword
+        description: "A single lower-case word to exclude from title term counts"
+        tests:
+          - unique
+          - not_null

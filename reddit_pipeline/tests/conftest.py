@@ -101,8 +101,10 @@ def warehouse(make_warehouse) -> FakeCursor:
 def wire_reddit(monkeypatch: pytest.MonkeyPatch):
     """Factory installing a fake PRAW client that serves one subreddit."""
 
-    def factory(subreddit: FakeSubreddit) -> None:
-        monkeypatch.setattr(_common.praw, "Reddit", lambda **_: FakeReddit(subreddit))
+    def factory(subreddit: FakeSubreddit, *, name: str = "worldnews", unreadable: tuple[str, ...] = ()) -> FakeReddit:
+        fake = FakeReddit(subreddit, name=name, unreadable=unreadable)
+        monkeypatch.setattr(_common.praw, "Reddit", lambda **_: fake)
+        return fake
 
     return factory
 

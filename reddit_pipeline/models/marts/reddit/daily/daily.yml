@@ -1,0 +1,164 @@
+version: 2
+
+models:
+  - name: mart_daily_edition
+    description: >
+      One row per story in a day's paper, ranked inside its section by
+      `engagement = score + 2 * comment_count`. Incremental on `edition_date`
+      (delete+insert), so each run replaces the last three editions and leaves every
+      older edition untouched.
+    columns:
+      - name: story_key
+        description: "`edition_date|post_id` — the row's identity across rebuilds"
+        tests:
+          - unique
+          - not_null
+      - name: edition_date
+        description: "The story's own creation date, not the build date"
+        tests:
+          - not_null
+      - name: section
+        description: "From the `sections` seed; `other` when the seed does not name the subreddit"
+        tests:
+          - not_null
+      - name: section_rank
+        description: "1-based position inside the section for that day"
+        tests:
+          - not_null
+      - name: post_id
+        description: "Reddit post id, foreign key to stg_reddit_posts"
+        tests:
+          - not_null
+      - name: domain
+        description: "First label of the link host (`bbc`, `pravda`); empty for self posts"
+        tests:
+          - not_null
+      - name: engagement
+        description: "score + 2 * comment_count — the ranking input"
+        tests:
+          - not_null
+      - name: rec_updated_at
+        description: "Audit timestamp stamped by add_audit_fields()"
+        tests:
+          - not_null
+
+  - name: mart_daily_section_summary
+    description: "Per-edition, per-section totals plus the section's lead story."
+    columns:
+      - name: section_key
+        description: "`edition_date|section`"
+        tests:
+          - unique
+          - not_null
+      - name: edition_date
+        description: "Edition the summary describes"
+        tests:
+          - not_null
+      - name: section
+        description: "Newspaper section"
+        tests:
+          - not_null
+      - name: story_count
+        description: "Number of stories printed in the section that day"
+        tests:
+          - not_null
+      - name: lead_story_title
+        description: "Title of the section's rank-1 story; null only if the section had none"
+      - name: rec_updated_at
+        description: "Audit timestamp stamped by add_audit_fields()"
+        tests:
+          - not_null
+
+  - name: mart_daily_trending_terms
+    description: >
+      Title terms with at least two stories that day, each with its own previous-week
+      baseline. `rise_ratio` above 1 means the term is running hot.
+    columns:
+      - name: term_key
+        description: "`edition_date|term`"
+        tests:
+          - unique
+          - not_null
+      - name: edition_date
+        description: "Day the term was counted on"
+        tests:
+          - not_null
+      - name: term
+        description: "Lower-case word, punctuation stripped, stopwords removed"
+        tests:
+          - not_null
+      - name: post_count
+        description: "Distinct stories that day whose title contained the term"
+        tests:
+          - not_null
+      - name: rise_ratio
+        description: "post_count / max(baseline posts per day, 1)"
+        tests:
+          - not_null
+      - name: rec_updated_at
+        description: "Audit timestamp stamped by add_audit_fields()"
+        tests:
+          - not_null
+
+  - name: mart_daily_reading_list
+    description: >
+      The day's ten longest-engaged self posts of at least 250 words. Reads the raw
+      staging table, not the edition, because the edition stores a truncated excerpt.
+      Empty while the ingest was r/worldnews alone: that subreddit is link-only and
+      carries no self posts. It fills from the seed's text-heavy subreddits
+      (askreddit, nostupidquestions, amitheasshole, personalfinance, …), whose rows
+      the multi-subreddit ingest now loads.
+    columns:
+      - name: reading_key
+        description: "`edition_date|post_id`"
+        tests:
+          - unique
+          - not_null
+      - name: edition_date
+        description: "The post's creation date"
+        tests:
+          - not_null
+      - name: reading_rank
+        description: "1-based position in the day's reading list"
+        tests:
+          - not_null
+      - name: word_count
+        description: "Whitespace-split word count of the full self text"
+        tests:
+          - not_null
+      - name: rec_updated_at
+        description: "Audit timestamp stamped by add_audit_fields()"
+        tests:
+          - not_null
+
+  - name: mart_subreddit_daily_volume
+    description: >
+      One row per (day, subreddit). Feeds the "what's busy" panel and doubles as the
+      pipeline's heartbeat: a subreddit at zero rows on a day the edition ran is a
+      broken extractor.
+    columns:
+      - name: subreddit_day_key
+        description: "`edition_date|subreddit`"
+        tests:
+          - unique
+          - not_null
+      - name: edition_date
+        description: "Day the posts were created"
+        tests:
+          - not_null
+      - name: subreddit
+        description: "Subreddit name as Reddit spells it"
+        tests:
+          - not_null
+      - name: post_count
+        description: "Posts collected for that subreddit that day"
+        tests:
+          - not_null
+      - name: posts_per_hour
+        description: "post_count over the span the posts cover, floored at one hour"
+        tests:
+          - not_null
+      - name: rec_updated_at
+        description: "Audit timestamp stamped by add_audit_fields()"
+        tests:
+          - not_null

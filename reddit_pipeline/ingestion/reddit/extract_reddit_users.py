@@ -1,4 +1,4 @@
-"""Collect r/worldnews users from Reddit and load them into Databricks.
+"""Collect author profiles from every seeded subreddit and load them into Databricks.
 
 Importing this module only loads environment variables; all Reddit API and
 Databricks work happens inside :func:`extract_users`, so the module stays
@@ -6,10 +6,10 @@ importable and runnable (`python -m ingestion.reddit.extract_reddit_users`).
 """
 
 from ingestion.reddit._common import (
-    POSTS_LIMIT,
-    SUBREDDIT,
     TARGET_USER_COUNT,
     USER_COMMENTS_PER_POST,
+    USER_POST_LIMIT,
+    USER_POST_WALK_LIMIT,
     USERS_COLUMNS,
     configure_logging,
     connect,
@@ -20,6 +20,8 @@ from ingestion.reddit._common import (
     logger,
     reddit_client,
     replace_by_key,
+    row_values,
+    subreddit_list,
     validate_env,
 )
 
@@ -27,7 +29,7 @@ TABLE = full_table("r_users")
 
 
 def extract_users() -> int:
-    """Extract r/worldnews user profiles and upsert them into Databricks.
+    """Extract the run's author profiles and upsert them into Databricks.
 
     Returns the number of user rows written. The load is key-based on `id`, so a
     user seen again this run replaces its previous row rather than duplicating it.
@@ -37,10 +39,11 @@ def extract_users() -> int:
     logger.info("Initializing Reddit API client...")
     reddit = reddit_client()
 
+    names = subreddit_list()
     logger.info(
-        "Collecting %d unique users who post/comment on r/%s...",
+        "Collecting %d unique users from the %d seeded subreddits...",
         TARGET_USER_COUNT,
-        SUBREDDIT,
+        len(names),
     )
     users: list[dict] = []
     seen_usernames: set[str] = set()
@@ -76,38 +79,52 @@ def extract_users() -> int:
         logger.debug("[%d/%d] Collected user from %s: %s", len(users), TARGET_USER_COUNT, source, author.name)
         return True
 
-    subreddit = reddit.subreddit(SUBREDDIT)
-
-    # 1. Hot submissions: the post author, then the authors of its top comments
-    logger.info("Fetching authors from hot submissions...")
-    for submission in subreddit.hot(limit=POSTS_LIMIT):
-        if len(users) >= TARGET_USER_COUNT:
-            break
-        collect(submission.author, "post")
-
+    # 1. Post authors across the seed: one listing read per subreddit, no comment cost.
+    logger.info("Fetching post authors...")
+    for name in names:
         if len(users) >= TARGET_USER_COUNT:
             break
         try:
-            submission.comments.replace_more(limit=0)
-        except Exception as exc:
-            logger.warning("Error reading comments for post %s: %s", submission.id, exc)
+            submissions = list(reddit.subreddit(name).new(limit=USER_POST_LIMIT))
+        except Exception as exc:  # private, banned, renamed, or rate limited
+            logger.warning("Skipping r/%s authors: %s", name, exc)
             continue
-        for comment in submission.comments[:USER_COMMENTS_PER_POST]:
+        for submission in submissions:
             if len(users) >= TARGET_USER_COUNT:
                 break
-            collect(comment.author, "comment")
+            collect(submission.author, f"r/{name} post")
 
-    # 2. Fallback: new submissions, if the hot posts and their comments fell short
+    # 2. Comment authors, if the post authors fell short: this is the expensive
+    #    half, one request per post, so it is only walked when it is still needed
+    #    and only over as many posts as the target requires.
     if len(users) < TARGET_USER_COUNT:
         logger.info(
-            "Collected %d users. Fetching from new submissions to reach %d...",
+            "Collected %d users from post authors. Reading comment authors to reach %d...",
             len(users),
             TARGET_USER_COUNT,
         )
-        for submission in subreddit.new(limit=POSTS_LIMIT):
-            if len(users) >= TARGET_USER_COUNT:
+        posts_walked = 0
+        for name in names:
+            if len(users) >= TARGET_USER_COUNT or posts_walked >= USER_POST_WALK_LIMIT:
                 break
-            collect(submission.author, "new post")
+            try:
+                submissions = list(reddit.subreddit(name).new(limit=USER_POST_LIMIT))
+            except Exception as exc:
+                logger.warning("Skipping r/%s comment authors: %s", name, exc)
+                continue
+            for submission in submissions:
+                if len(users) >= TARGET_USER_COUNT or posts_walked >= USER_POST_WALK_LIMIT:
+                    break
+                posts_walked += 1
+                try:
+                    submission.comments.replace_more(limit=0)
+                except Exception as exc:
+                    logger.warning("Error reading comments for post %s: %s", submission.id, exc)
+                    continue
+                for comment in submission.comments[:USER_COMMENTS_PER_POST]:
+                    if len(users) >= TARGET_USER_COUNT:
+                        break
+                    collect(comment.author, f"r/{name} comment")
 
     logger.info(
         "Successfully retrieved %d user profiles; %d profile fetches failed.",
@@ -117,19 +134,7 @@ def extract_users() -> int:
 
     # One load-time timestamp for every row of this run
     stamped_at = load_timestamp()
-    rows = [
-        (
-            user["username"],
-            user["id"],
-            user["created_utc"],
-            user["link_karma"],
-            user["comment_karma"],
-            user["is_employee"],
-            user["is_gold"],
-            stamped_at,
-        )
-        for user in users
-    ]
+    rows = [row_values(USERS_COLUMNS, {**user, "ingested_at": stamped_at}) for user in users]
 
     logger.info("Connecting to Databricks...")
     connection, cursor = connect()

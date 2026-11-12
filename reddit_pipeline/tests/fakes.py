@@ -132,6 +132,7 @@ class FakeSubmission:
         selftext: str = "",
         author: object = None,
         comments: list[FakeComment] | None = None,
+        subreddit: str = "worldnews",
     ) -> None:
         self.id = submission_id
         self.title = title
@@ -141,28 +142,51 @@ class FakeSubmission:
         self.created_utc = created_utc
         self.selftext = selftext
         self.author = author
-        self.subreddit = "worldnews"
+        self.subreddit = subreddit
         self.comments = FakeCommentForest(comments or [])
 
 
 class FakeSubreddit:
-    def __init__(self, hot: list[FakeSubmission], new: list[FakeSubmission] | None = None) -> None:
-        self._hot = hot
-        self._new = new or []
+    """One subreddit's two listings; whichever listing is not given is empty."""
 
-    def hot(self, limit: int | None = None) -> list[FakeSubmission]:
-        return self._hot if limit is None else self._hot[:limit]
+    def __init__(
+        self,
+        new: list[FakeSubmission],
+        top: list[FakeSubmission] | None = None,
+        name: str = "worldnews",
+    ) -> None:
+        self._new = new
+        self._top = top or []
+        self.name = name
+        self.top_time_filter: str | None = None
 
     def new(self, limit: int | None = None) -> list[FakeSubmission]:
         return self._new if limit is None else self._new[:limit]
 
+    def top(self, limit: int | None = None, time_filter: str | None = None) -> list[FakeSubmission]:
+        self.top_time_filter = time_filter
+        return self._top if limit is None else self._top[:limit]
+
 
 class FakeReddit:
-    def __init__(self, subreddit: FakeSubreddit, name: str = "worldnews") -> None:
-        self._subreddit = subreddit
-        self._name = name
+    """Serves named subreddits; every other name in the seed is an empty subreddit.
+
+    The extractors read the seeded list, which is many subreddits wide, so a fake
+    that served one name would turn every other name into a logged failure and
+    bury the behaviour under test in warnings.
+    """
+
+    def __init__(self, subreddit: FakeSubreddit, name: str = "worldnews", unreadable: tuple[str, ...] = ()) -> None:
+        self._by_name = {name: subreddit}
+        self._unreadable = set(unreadable)
+        self.requested: list[str] = []
 
     def subreddit(self, name: str) -> FakeSubreddit:
-        if name != self._name:
-            raise KeyError(f"fake serves only r/{self._name}, not r/{name}")
-        return self._subreddit
+        self.requested.append(name)
+        if name in self._unreadable:
+            raise KeyError(f"fake cannot read r/{name}")
+        return self._by_name.get(name, FakeSubreddit([], name=name))
+
+    def served(self, name: str) -> FakeSubreddit:
+        """The fake behind `name`, so a test can assert how it was asked for listings."""
+        return self._by_name[name]

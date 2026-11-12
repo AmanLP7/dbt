@@ -7,9 +7,9 @@
 }}
 
 -- Comment-grain history combining r_comments (via int_comments_enriched) with its
--- r_worldnews post context. The rolling window mirrors INCREMENTAL_WINDOW_HOURS in
--- the ingestion scripts: a full refresh rebuilds all history, while an incremental
--- run only merges comments created in the last five hours.
+-- r_posts post context. The window mirrors INCREMENTAL_WINDOW_HOURS in the
+-- ingestion scripts: a full refresh rebuilds all history, while an incremental run
+-- only merges comments created in the last 26 hours.
 with comments_enriched as (
     select * from {{ ref('int_comments_enriched') }}
 ),

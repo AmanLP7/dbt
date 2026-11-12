@@ -1,6 +1,6 @@
 ---
 name: reddit-extraction
-description: Running, debugging, or smoke-testing the three Reddit extraction modules, the shared `_common.py` scaffolding they rely on, the Dagster code location that orchestrates them (three extractor assets merged into the dbt sources, then one `dbt build` asset) — what each loads into Databricks, the function entrypoints and the raise-not-sys.exit rule retries depend on, the required .env variables, the rolling 5-hour window that makes the posts/comments loads incremental, the key-based upsert for users, the single parameterised insert path, the trailing `ingested_at` column, the missing runtime dependencies, and how to exercise the modules end to end without network or credentials using stubbed clients.
+description: Running, debugging, or smoke-testing the three Reddit extraction modules, the shared `_common.py` scaffolding they rely on, the Dagster code location that orchestrates them (three extractor assets merged into the dbt sources, then one `dbt build` asset) — what each loads into Databricks, the function entrypoints and the raise-not-sys.exit rule retries depend on, the required .env variables, the seed-driven subreddit list, the 26-hour read window, the key-based upsert all three loads share, the single parameterised insert path, the trailing `ingested_at` column, the missing runtime dependencies, and how to exercise the modules end to end without network or credentials using stubbed clients.
 globs: ["ingestion/reddit/**/*.py", "orchestration/**/*.py", "tests/**/*.py"]
 ---
 
@@ -29,10 +29,10 @@ The `-m` form (`ingestion/reddit/_common.py` and the extractors use absolute
 imports) must be run from the repo root.
 
 `orchestration/src/reddit_pipeline_orchestration/definitions.py` imports the three
-and wraps each in a Dagster asset — `reddit_raw/r_worldnews`,
+and wraps each in a Dagster asset — `reddit_raw/r_posts`,
 `reddit_raw/r_comments`, `reddit_raw/r_users` — plus one `@dbt_assets` definition,
 `dbt_reddit`. Comments and users declare `deps=[RAW_POSTS_KEY]`, so the job runs
-posts -> comments/users -> dbt (comments and users derive from the same hot posts,
+posts -> comments/users -> dbt (comments and users derive from the same post listings,
 so the order matters). Each extractor asset is declared under the asset key Dagster
 derives for its `reddit_raw.r_*` source, so the source spec merges into the extractor
 and the staging models depend on the loads. `dbt_reddit` runs
@@ -40,8 +40,9 @@ and the staging models depend on the loads. `dbt_reddit` runs
 no `--select` that builds and tests every model in the project, so the step works on a
 warehouse where dbt has never run. The dbt models declare their own dependencies from
 the manifest, so they are not hand-listed in the job. `reddit_refresh` is a job over
-`AssetSelection.all()` with **no schedule** — runs are on demand, from the UI or
-`dagster asset materialize`. All four assets carry three retries with an exponential
+`AssetSelection.all()`; its one schedule is `daily_edition_refresh` (cron
+`0 5 * * *`, UTC), which ships **stopped**, so nothing writes on its own until it is
+turned on in the UI. All four assets carry three retries with an exponential
 backoff plus jitter, ported from the Prefect tasks. See
 `orchestration/README.md` for the full graph, commands and deployment notes.
 
@@ -67,14 +68,16 @@ scripts.
 
 Everything the three extractors used to duplicate lives here:
 
-- constants: `INCREMENTAL_WINDOW_HOURS = 5`, `SUBREDDIT = "worldnews"`,
-  `CATALOG`/`SCHEMA`, `POSTS_LIMIT = 1000`, `COMMENTS_PER_POST = 10`,
-  `USER_COMMENTS_PER_POST = 15`, `TARGET_USER_COUNT = 200`, `REQUIRED_ENV`, and
-  the per-table column mappings (`POSTS_COLUMNS`, `COMMENTS_COLUMNS`,
-  `USERS_COLUMNS`).
+- constants: `INCREMENTAL_WINDOW_HOURS = 26`, `SECTION_SEED`, `CATALOG`/`SCHEMA`,
+  the two listing bounds (`NEW_POSTS_LIMIT`, `TOP_POSTS_LIMIT`, `TOP_TIME_FILTER`),
+  the comment and user budgets (`COMMENT_POST_LIMIT`, `COMMENTS_PER_POST`,
+  `USER_POST_LIMIT`, `USER_COMMENTS_PER_POST`, `TARGET_USER_COUNT`),
+  `REQUIRED_ENV`, and the per-table column mappings (`POSTS_COLUMNS`,
+  `COMMENTS_COLUMNS`, `USERS_COLUMNS`).
 - helpers: `validate_env()`, `reddit_client()`, `connect()`, `full_table()`,
-  `window_cutoff()`, `load_timestamp()`, `ensure_table()`, `ensure_columns()`,
-  `replace_window()`, `replace_by_key()`, `configure_logging()`, plus a module
+  `subreddit_list()`, `subreddit_listings()`, `harvest_submissions()`,
+  `row_values()`, `window_cutoff()`, `load_timestamp()`, `ensure_table()`,
+  `ensure_columns()`, `replace_by_key()`, `configure_logging()`, plus a module
   `logger`.
 
 The extractors import these by name; they own no I/O of their own (no `praw`, no
@@ -85,42 +88,58 @@ The extractors import these by name; they own no I/O of their own (no `praw`, no
 
 | Module | Source | Target table | Volume |
 | --- | --- | --- | --- |
-| `ingestion/reddit/extract_reddit.py` | `subreddit.hot(limit=1000)` | `workspace.topic_raw.r_worldnews` | 1 row/post |
-| `ingestion/reddit/extract_reddit_comments.py` | same hot posts, `comments[:10]` each, `replace_more(limit=0)` | `workspace.topic_raw.r_comments` | ~10000 rows |
-| `ingestion/reddit/extract_reddit_users.py` | post authors and comment authors from `subreddit.hot(limit=1000)`, then `subreddit.new(limit=1000)` fallback | `workspace.topic_raw.r_users` | ≤ 200 profiles |
+| `ingestion/reddit/extract_reddit.py` | every seeded subreddit: `new(limit=100)` + `top(limit=100, time_filter='day')` | `workspace.topic_raw.r_posts` | 1 row/post, ≤ 13,200 posts |
+| `ingestion/reddit/extract_reddit_comments.py` | the 200 most-commented in-window posts, `comments[:10]` each, `replace_more(limit=0)` | `workspace.topic_raw.r_comments` | ≤ 2,000 rows |
+| `ingestion/reddit/extract_reddit_users.py` | post authors from `new(limit=50)` across the seed, then comment authors if short | `workspace.topic_raw.r_users` | ≤ 200 profiles |
+
+**The subreddit list is the seed.** `subreddit_list()` reads
+`seeds/sections.csv`, the same file that maps a subreddit to its newspaper section,
+so adding a subreddit is one seed row and the ingest cannot drift from the marts'
+section map. 66 subreddits today; two listing requests each, so 132 requests per
+posts run against a 6,000/hour budget. A subreddit that cannot be read — private,
+banned, renamed, rate limited — is logged at `WARNING` and skipped rather than
+failing a run that has already spent requests on the others.
+
+Posts are deduped by id across both listings before loading, so a story that is both
+new and top-of-day is written once, with the `top` reading's score (that listing runs
+second and carries the fresher number). Comments are fetched only for the most
+commented posts because comment fetching is one request per post.
 
 Each script calls `ensure_table()` (which issues `CREATE CATALOG/SCHEMA/TABLE IF
 NOT EXISTS` before loading) and then `ensure_columns()`.
 
-Loads are incremental, not full refreshes:
+Loads are key-based upserts, all three of them:
 
-- **Posts and comments** load a **rolling 5-hour window** on the entity's own
-  `created_utc` (`INCREMENTAL_WINDOW_HOURS = 5`): `window_cutoff()` computes
-  `time.time() - 5 * 3600` once per run, then `replace_window()` binds that cutoff
-  into `DELETE FROM <table> WHERE created_utc >= ?` and inserts only the fetched
-  rows at or after it, so the entrypoint returns the in-window row count rather
-  than the fetched count. Rows older than the window are retained and never
-  rewritten: both tables accumulate history. If no fetched row falls in the window
-  the run skips **both** the delete and the insert — it never deletes with nothing
-  to insert, and it logs how many rows were fetched versus kept in-window.
-- **Users** have no window: an account's `created_utc` is its account age, not
-  recency. `replace_by_key()` is a key-based upsert — `DELETE FROM ... WHERE id IN
-  (?, ?, ...)` (ids passed as bound parameters) followed by an insert of all
-  fetched rows — so returning users get refreshed karma/gold and new users are
-  added, without duplicates. Nothing fetched means both statements are skipped.
-  Profile reads are what trigger the per-author API request, so a suspended,
-  deleted or private account raises there; the collector counts those failures,
-  logs each at `WARNING`, and reports the total in its summary instead of
+- `replace_by_key()` deletes exactly the ids fetched this run (`DELETE FROM <table>
+  WHERE id IN (?, ?, ...)`, chunked at `DELETE_CHUNK_ROWS`) and inserts the fetched
+  rows in batched multi-row statements. The two are **interleaved per chunk** — delete
+  a chunk, insert that chunk, next chunk — not run as two passes over everything.
+  Nothing is ever deleted by time.
+  A time-scoped delete cannot be exact once a run reads many subreddits through
+  bounded listings: two consecutive runs cover different spans of the same day, so
+  the second would delete rows the first wrote and never refetch them.
+- `INCREMENTAL_WINDOW_HOURS = 26` survives as a **read** filter only:
+  `window_cutoff()` computes `time.time() - 26 * 3600` once per run, and fetched
+  rows older than it are dropped before the load. The entrypoint returns the
+  written count, and logs fetched-versus-kept. 26 rather than 24 because a daily
+  cadence with a 24-hour window leaves a gap whenever the run lands a minute late.
+- **Users** carry no window at all: an account's `created_utc` is its account age,
+  not recency. Profile reads are what trigger the per-author API request, so a
+  suspended, deleted or private account raises there; the collector counts those
+  failures, logs each at `WARNING`, and reports the total in its summary instead of
   swallowing them.
 
 Two consequences, stated honestly:
 
-- The delete is scoped to the window and the source fetch is bounded, so a post
-  or comment that ages out of the source while still inside the window is
-  deleted and not re-inserted unless the fetch still returns it.
 - The DELETE and INSERT are separate autocommitted statements. A failure between
-  them leaves the window rows absent rather than restoring the previous
-  snapshot; a retry re-fetches and rewrites the window.
+  them leaves that chunk's ids absent rather than restoring the previous rows; a
+  retry re-fetches and rewrites them. The interleaving is what keeps the damage to
+  one chunk of at most `DELETE_CHUNK_ROWS` ids — deleting everything first would
+  strand the whole run at once, including rows older than the 26-hour read window
+  that no later run can reach.
+- A post that ages out of both listings simply stops being refreshed. Its row stays,
+  so the raw tables accumulate history — nothing prunes them, and `open_listings`-style
+  liveness is not what they measure.
 
 This still bounds every downstream number: `r_comments` only ever holds the
 comments the extractor actually saw — those of the posts hot in the rolling
@@ -129,18 +148,19 @@ extraction window, not the post's true comment count (`total_comments_on_reddit`
 
 ## One parameterised insert path
 
-All three loaders now share a single strategy: `_insert_sql()` builds
-`INSERT INTO <table> (<cols>) VALUES (?, ?, ...)` and `executemany` binds one
-tuple per row. Nothing about a row is interpolated into SQL text — the two
+All three loaders share a single strategy: `_insert_sql()` builds
+`INSERT INTO <table> (<cols>) VALUES (?, ?, ...)` for a batch and the values travel
+bound. `executemany` is not used — measured at 1.7–2.0 s per row against this
+warehouse. Nothing about a row is interpolated into SQL text — the two
 hand-rolled `escape_str()` helpers that used to build `INSERT`/`WHERE id IN`
 strings for the posts and users loads are gone. The only things ever interpolated
 are identifiers (catalog, schema, table and column names), which cannot be bound.
 
-`replace_window()` and `replace_by_key()` differ only in the delete predicate
-(window cutoff vs. fetched key set); both then call `_insert_sql()` +
-`executemany`. Tests assert the payload never reaches the SQL string: a comment
-body containing `O'Brien; DROP TABLE …; --` travels as a parameter
-(`tests/test_extractors.py`).
+`_insert_rows()` chunks rows into multi-row `INSERT ... VALUES (...), (...)` statements
+under both DBSQL bounds (50 rows, and 768 KiB of bound UTF-8 bytes — measured in
+bytes, not characters, because a comment body is user text and an emoji is four).
+Tests assert the payload never reaches the SQL string: a comment body containing
+`O'Brien; DROP TABLE …; --` travels as a parameter (`tests/test_extractors.py`).
 
 ## Raw table columns and `ingested_at`
 

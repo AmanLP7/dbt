@@ -41,6 +41,10 @@ aliasing = implicit
 [sqlfluff:rules:references.keywords]
 # `source`, `users` and `title` are not reserved in the Databricks dialect and
 # are used here as a CTE name and as column names taken straight from the raw
-# Reddit tables, so keep the rule off for these three words only.
-ignore_words = source,users,title
+# Reddit tables, so keep the rule off for these three words only. `section` and
+# `domain` are the daily edition's own column names: `section` is the newspaper
+# page a story prints on and `domain` the outlet it links to, and both are what
+# the app reads, so the model keeps them rather than renaming them around a
+# dialect keyword.
+ignore_words = source,users,title,section,domain
 unquoted_identifiers_policy = all

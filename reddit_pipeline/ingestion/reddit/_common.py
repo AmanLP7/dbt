@@ -1,9 +1,9 @@
 """Shared scaffolding for the Reddit extractors.
 
 Holds what the three extractors would otherwise duplicate: the tuning constants,
-environment validation, the Reddit and Databricks clients, the idempotent target
-table setup, and the two parameterised incremental load strategies (rolling
-window and key-based upsert).
+the subreddit list (read from the dbt section seed), environment validation, the
+Reddit and Databricks clients, the idempotent target table setup, and the
+parameterised incremental load strategy.
 
 Importing this module loads `.env` and does nothing else: no Reddit API call, no
 Databricks connection.
@@ -15,12 +15,14 @@ names), which cannot be bound.
 
 from __future__ import annotations
 
+import csv
 import datetime
 import logging
 import os
+import pathlib
 import time
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING, Any, Protocol
 
 import praw
@@ -30,6 +32,25 @@ from dotenv import load_dotenv
 
 if TYPE_CHECKING:
     from databricks.sql.client import Connection, Cursor
+
+
+class Submission(Protocol):
+    """The listing fields the extractors read off a PRAW submission.
+
+    A protocol rather than PRAW's own type: the extractors only touch these
+    fields, and a test double then stands in without a network.
+    """
+
+    id: str
+    title: str
+    score: int
+    url: str
+    num_comments: int
+    created_utc: float
+    selftext: str
+    author: Any
+    comments: Any
+    subreddit: Any
 
 
 class SqlExecutor(Protocol):
@@ -44,19 +65,43 @@ class SqlExecutor(Protocol):
     def fetchall(self) -> Sequence[Sequence[Any]]: ...
 
 
-# Rolling window (hours) on an entity's own created_utc: rows older than this are
-# left untouched, so posts and comments accumulate history across runs.
-INCREMENTAL_WINDOW_HOURS = 5
-
-SUBREDDIT = "worldnews"
+# Rolling window (hours) on an entity's own created_utc: a run loads the rows it
+# fetched inside this window and ignores older ones. 26 rather than 24 so a daily
+# build always covers the previous calendar day with slack; `macros/window_hours.sql`
+# repeats it for the dbt side and `tests/test_window_contract.py` pins them together.
+INCREMENTAL_WINDOW_HOURS = 26
 
 CATALOG = "workspace"
 SCHEMA = "topic_raw"
 
-# Bounds on the source fetch: how many hot posts to walk, how many comments to
-# take per post for the comments table, and how many user profiles to collect.
-POSTS_LIMIT = 1000
+# The subreddit list is not a constant here: it is `seeds/sections.csv`, the same
+# file that maps a subreddit to its newspaper section. Adding a subreddit is a data
+# change in one file, and the ingest cannot drift from the seed the marts join on.
+SECTION_SEED = pathlib.Path(__file__).resolve().parents[2] / "seeds" / "sections.csv"
+
+# Two bounded listings per subreddit, `new` for what is being posted right now
+# (the volume and recency the daily-volume mart measures) and `top(day)` for the
+# stories that have already earned their place on the page. PRAW pages a listing
+# only when asked for more than one request's worth, so each listing costs one
+# request whatever the item cap: two per subreddit, 132 for today's seed.
+NEW_POSTS_LIMIT = 100
+TOP_POSTS_LIMIT = 100
+TOP_TIME_FILTER = "day"
+
+# Comments cost one request per post, so they are fetched for the most-commented
+# posts of the run rather than every post: 200 requests against a 6,000/hour
+# budget, and the edition's engagement comes from the listing's own comment
+# count, not from this table.
+COMMENT_POST_LIMIT = 200
 COMMENTS_PER_POST = 10
+
+# Users cost one request per post whose comment forest is walked, plus one per
+# profile read. `USER_POST_LIMIT` is how many posts one subreddit's listing
+# yields; `USER_POST_WALK_LIMIT` bounds the comment-forest walks across the whole
+# run, so the expensive phase can look at several subreddits instead of spending
+# its budget on the first one.
+USER_POST_LIMIT = 50
+USER_POST_WALK_LIMIT = 200
 USER_COMMENTS_PER_POST = 15
 TARGET_USER_COUNT = 200
 
@@ -94,6 +139,7 @@ COMMENTS_COLUMNS: OrderedDict[str, str] = OrderedDict(
         ("author", "STRING"),
         ("created_utc", "DOUBLE"),
         ("parent_id", "STRING"),
+        ("subreddit", "STRING"),
         ("ingested_at", "TIMESTAMP"),
     ]
 )
@@ -190,8 +236,63 @@ def full_table(name: str) -> str:
     return f"{CATALOG}.{SCHEMA}.{name}"
 
 
+def subreddit_list(seed: pathlib.Path = SECTION_SEED) -> tuple[str, ...]:
+    """The subreddits to ingest, in seed order, read from `seeds/sections.csv`.
+
+    The section seed is the single source of the list: it already names every
+    subreddit the newspaper prints, and reading it here means adding a subreddit
+    stays a one-file data change that cannot drift between ingest and marts. The
+    names are lower-case there and in the raw table, so the join needs no case
+    folding; Reddit itself is case-insensitive.
+    """
+    with seed.open(newline="", encoding="utf-8") as handle:
+        return tuple(row["subreddit"].strip() for row in csv.DictReader(handle) if row["subreddit"].strip())
+
+
+def subreddit_listings(client: praw.Reddit, name: str) -> Iterator[Submission]:
+    """The two bounded listings this pipeline reads for one subreddit.
+
+    `new` is the firehose and `top(day)` the already-earned page, so a story that
+    is rising now and one that peaked this morning are both seen. Two requests
+    per subreddit, whatever the traffic.
+    """
+    subreddit = client.subreddit(name)
+    yield from subreddit.new(limit=NEW_POSTS_LIMIT)
+    yield from subreddit.top(limit=TOP_POSTS_LIMIT, time_filter=TOP_TIME_FILTER)
+
+
+def harvest_submissions(client: praw.Reddit, names: Sequence[str]) -> tuple[list[Submission], list[str]]:
+    """Every listing post from `names`, deduped by id, plus the names that failed.
+
+    A post appears in both listings, so the dict keeps the later one: `top` runs
+    second and carries the fresher score. One unreadable subreddit — private,
+    banned, renamed, or rate-limited — is logged and skipped rather than sinking a
+    run that has already spent requests on the others; the failures are returned
+    so the caller can report how many of the seed's subreddits it actually read.
+    """
+    posts: dict[str, Submission] = {}
+    failed: list[str] = []
+    for name in names:
+        try:
+            for submission in subreddit_listings(client, name):
+                posts[submission.id] = submission
+        except Exception as exc:  # private, banned, renamed, or rate limited
+            failed.append(name)
+            logger.warning("Skipping r/%s: %s", name, exc)
+    return list(posts.values()), failed
+
+
+def row_values(columns: OrderedDict[str, str], record: dict[str, Any]) -> tuple[Any, ...]:
+    """The positional row for `columns`, taken from `record` by name.
+
+    Building the tuple by name rather than by hand keeps a column inserted in the
+    middle of the mapping from silently shifting every value after it.
+    """
+    return tuple(record[name] for name in columns)
+
+
 def window_cutoff() -> float:
-    """Most recent epoch second the rolling window keeps, computed once per run."""
+    """Oldest epoch second a run will write, computed once per run (a read filter)."""
     return time.time() - INCREMENTAL_WINDOW_HOURS * 3600
 
 
@@ -227,23 +328,31 @@ def ensure_columns(cursor: SqlExecutor, table: str, columns: OrderedDict[str, st
 # cost 2.00 s per comment row and 1.68 s per user row, so a 200-user load spent
 # five and a half minutes on round trips. Rows are instead batched into
 # multi-row INSERTs, and both bounds below apply. The row cap keeps the
-# statement readable and the parameter count low; the character cap is the
-# server's own limit, which a single large body can exhaust on its own — DBSQL
-# rejects a statement whose parameters total more than _PARAMETER_CHARS. A row
+# statement readable and the parameter count low; the byte cap is the server's
+# own limit, which a single large body can exhaust on its own — DBSQL rejects a
+# statement whose bound parameters total more than _PARAMETER_BYTES. A row
 # bigger than the whole budget still goes alone; truncating it would break the
 # raw table's fidelity contract.
 INSERT_CHUNK_ROWS = 50
-_PARAMETER_CHARS = 1_048_576
-INSERT_CHUNK_CHARS = _PARAMETER_CHARS * 3 // 4
+_PARAMETER_BYTES = 1_048_576
+INSERT_CHUNK_CHARS = _PARAMETER_BYTES * 3 // 4
+
+# A key delete carries one parameter per id, so it is bounded by the same
+# parameter limit but nothing else: 5,000 short ids stay far inside it, and a run
+# reading every subreddit in the seed needs a handful of statements rather than
+# one per row.
+DELETE_CHUNK_ROWS = 5_000
 
 
-def _row_chars(row: Sequence[Any]) -> int:
-    """Approximate the parameter cost of one row, in characters.
+def _row_bytes(row: Sequence[Any]) -> int:
+    """Approximate the parameter cost of one row, in UTF-8 bytes.
 
-    Strings dominate and are what the server counts; the rest are ids, scores
-    and timestamps, which contribute a constant few bytes each.
+    The server's limit is bytes, not characters, and a comment body is user text:
+    a single emoji is four bytes. Counting `len()` instead understates a
+    non-ASCII row by up to 4×, and the batch that follows then trips the limit.
+    Non-strings are ids, scores and timestamps — a constant few bytes each.
     """
-    return sum(len(value) if isinstance(value, str) else 8 for value in row)
+    return sum(len(value.encode()) if isinstance(value, str) else 8 for value in row)
 
 
 def chunk_rows(rows: Sequence[Sequence[Any]]) -> list[list[Sequence[Any]]]:
@@ -252,7 +361,7 @@ def chunk_rows(rows: Sequence[Sequence[Any]]) -> list[list[Sequence[Any]]]:
     current: list[Sequence[Any]] = []
     size = 0
     for row in rows:
-        cost = _row_chars(row)
+        cost = _row_bytes(row)
         if current and (len(current) >= INSERT_CHUNK_ROWS or size + cost > INSERT_CHUNK_CHARS):
             chunks.append(current)
             current, size = [], 0
@@ -282,27 +391,6 @@ def _insert_rows(
         cursor.execute(_insert_sql(table, columns, len(chunk)), params)
 
 
-def replace_window(
-    cursor: SqlExecutor,
-    table: str,
-    columns: OrderedDict[str, str],
-    rows: Sequence[tuple[Any, ...]],
-    cutoff_col: str,
-    cutoff: float,
-) -> int:
-    """Replace the rolling window on `cutoff_col` and insert `rows`.
-
-    Does nothing when there is nothing to insert — a delete with no insert would
-    drop rows that no fetch can restore. Returns the number of rows written.
-    """
-    if not rows:
-        logger.info("No rows to load into %s; skipping delete and insert.", table)
-        return 0
-    cursor.execute(f"DELETE FROM {table} WHERE {cutoff_col} >= ?;", (cutoff,))
-    _insert_rows(cursor, table, columns, rows)
-    return len(rows)
-
-
 def replace_by_key(
     cursor: SqlExecutor,
     table: str,
@@ -312,15 +400,34 @@ def replace_by_key(
 ) -> int:
     """Upsert `rows` by `key`: delete the fetched keys, then insert the rows.
 
-    Does nothing when there is nothing to insert. Returns the number of rows
-    written.
+    Every raw load is an upsert on the entity's own id, never a window rewrite.
+    A `delete where created_utc >= cutoff` scope cannot be exact once a run reads
+    several subreddits through bounded listings: two consecutive runs cover
+    different spans of the same day, so the second deletes rows the first wrote
+    and never refetches them. Deleting exactly the ids fetched this run is
+    lossless whatever the run's coverage, and it keeps one row per entity instead
+    of one per run. `stg_reddit_*` still dedupes, as the at-least-once case —
+    rows committed whose acknowledgement was lost — can still land twice.
+
+    Each statement autocommits and there is no transaction spanning the two, so
+    the delete and the insert are *interleaved* by chunk rather than run as two
+    passes: delete a chunk, write that chunk, next chunk. Deleting everything
+    first would let a single failed INSERT leave the whole run's ids gone, and a
+    daily run only reads the last 26 hours, so rows older than that at delete
+    time would never come back. Interleaved, a failure can strand at most one
+    chunk — and that chunk re-fetches on the next run.
+
+    Does nothing when there is nothing to insert: a delete with no insert would
+    drop rows that no fetch can restore. Returns the number of rows written.
     """
     if not rows:
         logger.info("No rows to load into %s; skipping delete and insert.", table)
         return 0
     key_index = list(columns).index(key)
-    keys = tuple(row[key_index] for row in rows)
-    placeholders = ", ".join("?" for _ in keys)
-    cursor.execute(f"DELETE FROM {table} WHERE {key} IN ({placeholders});", keys)
-    _insert_rows(cursor, table, columns, rows)
+    for start in range(0, len(rows), DELETE_CHUNK_ROWS):
+        group = rows[start : start + DELETE_CHUNK_ROWS]
+        keys = tuple(row[key_index] for row in group)
+        placeholders = ", ".join("?" for _ in keys)
+        cursor.execute(f"DELETE FROM {table} WHERE {key} IN ({placeholders});", keys)
+        _insert_rows(cursor, table, columns, group)
     return len(rows)

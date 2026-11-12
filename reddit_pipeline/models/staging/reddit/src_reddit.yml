@@ -13,7 +13,7 @@ sources:
         warn_after: {count: 12, period: hour}
         error_after: {count: 24, period: hour}
     tables:
-      - name: r_worldnews
+      - name: r_posts
         columns:
           - name: ingested_at
             description: "Timestamp at which the loader wrote the row; source freshness field"

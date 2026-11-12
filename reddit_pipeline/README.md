@@ -3,24 +3,27 @@
 This dbt project is designed to transform and model Reddit data on Databricks.
 
 ## Architecture & Flow
-1. **Extraction**: Fetch raw Reddit data (hot posts, their comments, and user profiles) from r/worldnews with PRAW.
-2. **Load**: Insert the rows into Databricks Delta tables incrementally (a rolling 5-hour window for posts/comments, a key-based upsert for users).
+1. **Extraction**: Fetch every subreddit named in `seeds/sections.csv` (66 today) with PRAW — each one's `new` and `top(day)` listings, the most-commented posts' comments, and the authors' profiles.
+2. **Load**: Upsert into Databricks Delta by id — a chunked `DELETE WHERE id IN (…)` then a batched insert. All three loaders work this way; a 26-hour read filter decides which fetched rows are worth writing, and nothing is ever deleted by time.
 3. **Transformation (dbt)**: Model and clean raw data into staging, intermediate, and marts layers.
 4. **Orchestration**: a Dagster job runs the extractors in order, then one `dbt build`.
 
 ## Project Structure
 - `models/staging/`: Raw source data cleaning, renaming, and type casting.
 - `models/intermediate/`: Complex joins, aggregations, and business logic.
-- `models/marts/`: Final analytics-ready tables for consumption (e.g. sentiment analysis, post metrics, user activity). Includes `mart_comment_history`, a comment-id-grain incremental mart that combines `r_comments` with its `r_worldnews` post context over a rolling 5-hour window.
+- `models/marts/`: Final analytics-ready tables for consumption. `mart_post_summary` and `mart_user_metrics` are rebuilt on every run; the comment-id-grain `mart_comment_history` (which combines `r_comments` with its `r_posts` post context over a 26-hour window) is `incremental` and merges on `comment_id`, so history accumulates instead of being recomputed.
+- `models/marts/reddit/daily/`: the daily edition. `mart_daily_edition` (ranked stories per section), `mart_daily_section_summary`, `mart_daily_trending_terms`, `mart_daily_reading_list`, `mart_subreddit_daily_volume`. All five are `incremental` on `edition_date` with `delete+insert`, so each run replaces the last three editions and every older edition survives the raw tables rolling. The edition date is the story's own creation date, not the build date, so rebuilding reproduces the same paper.
 - Each layer keeps its models in a source-named subfolder — currently `reddit/`, so a second source can sit beside it: `models/staging/reddit/`, `models/intermediate/reddit/`, `models/marts/reddit/`. The layer's materialisation in `dbt_project.yml` is inherited by the subfolder.
-- `ingestion/reddit/`: the Python extractors that fetch Reddit data and load it into Databricks — one module per entity, plus `_common.py` holding the scaffolding they share (constants, env validation, clients, table setup, the two load strategies). Like the model layers, `ingestion/` groups extractors into a source-named subpackage — currently `reddit/`; `ingestion/__init__.py` and `ingestion/reddit/__init__.py` are package markers.
+- `ingestion/reddit/`: the Python extractors that fetch Reddit data and load it into Databricks — one module per entity, plus `_common.py` holding the scaffolding they share (constants, env validation, clients, table setup, the key-based upsert). Like the model layers, `ingestion/` groups extractors into a source-named subpackage — currently `reddit/`; `ingestion/__init__.py` and `ingestion/reddit/__init__.py` are package markers.
 - `orchestration/`: the Dagster code location (`reddit_pipeline_orchestration.definitions`). Three extractor assets and one dbt-assets definition, merged into a single graph by asset key; see [Orchestration](#orchestration).
 - `tests/`: the offline pytest suite — `conftest.py` fixtures, `fakes.py` test doubles, and the extractor/definitions/asset/window-contract tests. No network and no warehouse.
 - `profiles/profiles.yml`: the repo-owned dbt profile (see Quick Start).
-- `macros/`: Reusable Jinja macros, e.g. `add_audit_fields()` and `window_hours()`.
+- `seeds/sections.csv`: maps a subreddit to its newspaper section (`world`, `politics`, `business`, `tech`, `science`, `sports`, `culture`, `discussion`) plus a weight. A subreddit absent from the seed still prints, under `other`; the seed decides the front page's shape, not whether a subreddit is ingested.
+- `seeds/trending_stopwords.csv`: words removed from story titles before the trending-terms mart counts them — grammar and news furniture only.
+- `macros/`: Reusable Jinja macros, e.g. `add_audit_fields()`, `window_hours()` and `story_domain()`.
 - `.env.example`: the configuration template; copy it to `.env` (gitignored) and fill it in.
 - `dbt_project.yml`: project config — `model-paths: ["models"]`, `macro-paths: ["macros"]`, the standard `analysis-paths`/`test-paths`/`seed-paths`/`snapshot-paths` entries and `clean-targets`. Materialisation is set per layer, and the rolling-window constant lives in the `window_hours()` macro rather than as a dbt variable.
-- `tests/` is both dbt's default singular-test directory and the pytest suite's directory. That overlap is harmless: dbt only collects `.sql` files from `test-paths`, so the Python suite is invisible to it. `analyses/`, `seeds/` and `snapshots/` are the dbt defaults and hold only `.gitkeep`.
+- `tests/` is both dbt's default singular-test directory and the pytest suite's directory. That overlap is harmless: dbt only collects `.sql` files from `test-paths`, so the Python suite is invisible to it. `analyses/` and `snapshots/` are the dbt defaults and hold only `.gitkeep`; `seeds/` carries the two CSVs above.
 
 ## Quick Start
 
@@ -145,50 +148,61 @@ python -m ingestion.reddit.extract_reddit
 They live under `ingestion/` rather than under `models/` because dbt treats every
 `.py` file under its model paths as a Python model. Everything the three used to
 duplicate now lives in `ingestion/reddit/_common.py` — the tuning constants, env
-validation, the Reddit and Databricks clients, table setup, and the two load
-strategies described below.
+validation, the Reddit and Databricks clients, table setup, and the key-based load
+strategy described below.
 
 Loads are incremental, not full refreshes, and each writes a trailing
 `ingested_at TIMESTAMP` column stamped at load time (the UTC time the row was
 written, not a value Reddit supplied):
 
-- `ingestion/reddit/extract_reddit.py` and
-  `ingestion/reddit/extract_reddit_comments.py` load
-  a **rolling 5-hour window** on the entity's own `created_utc`
-  (`INCREMENTAL_WINDOW_HOURS = 5`). Each run deletes only the rows inside that
-  window (`DELETE FROM <table> WHERE created_utc >= ?`) and inserts only
-  the fetched rows that fall inside it. Older rows are retained and never
-  rewritten, so both tables accumulate history instead of being replaced. If
-  the fetch contains nothing inside the window, the run skips both the delete
-  and the insert. Their entrypoints return the in-window row count.
-- `ingestion/reddit/extract_reddit_users.py` has no window — an account's `created_utc`
-  is its account age, not recency. It is a key-based upsert: `DELETE WHERE id IN
-  (<fetched ids>)` followed by an insert of the fetched rows, so returning users
-  get refreshed karma/gold and new users are added, with no duplicates. Per-author
-  profile failures (suspended, deleted, private) are counted, logged at `WARNING`,
-  and reported in the run summary rather than swallowed.
+All three loaders are **key-based upserts**: `DELETE FROM <table> WHERE id IN
+(<fetched ids>)` in chunks of 5,000, each chunk's delete immediately followed by that
+chunk's batched insert. A rolling
+window is not used, because a run reads several subreddits through bounded listings
+and two consecutive runs cover different spans of the same day — a
+`WHERE created_utc >= <cutoff>` delete would drop rows the run never refetched. The
+window survives only as a *read* filter on the posts and comments loads:
+`INCREMENTAL_WINDOW_HOURS = 26` decides which fetched rows are worth writing, and
+nothing is ever deleted by time. The users load carries no window at all — it upserts
+whatever profiles the run collected.
 
-Both strategies are **parameterised**: every value is bound as a `?` parameter and
+26 rather than 24 because the pipeline runs once a day and a 24-hour window landing
+a minute late leaves a gap between consecutive runs. Posts and comments upsert on
+`id`; users upsert on the profile `id`, so a returning user gets refreshed
+karma/gold and a new one is added. Per-author profile failures (suspended, deleted,
+private) are counted, logged at `WARNING`, and reported in the run summary rather
+than swallowed. A post fetched with nothing new inside the window skips both the
+delete and the insert.
+
+`stg_reddit_*` still dedupes by id. That is the at-least-once case, not the
+expected one: a statement committed whose acknowledgement was lost is retried and
+the rows land twice, and the source tables keep the duplicate rather than pretending
+to be exactly-once.
+
+Every statement is **parameterised**: every value is bound as a `?` parameter and
 no value is interpolated into SQL text — only identifiers (table/column names) are.
 Rows are batched into multi-row `INSERT ... VALUES (...), (...)` statements rather
 than sent one statement per row: the connector's `executemany` costs a full round
 trip each, measured at 1.7–2.0 s per row against this warehouse, so a 200-user load
 spent five and a half minutes on round trips alone. With batching that same load
 wrote 200 users in 30.5 s, an 11× reduction. Each statement carries at most
-`INSERT_CHUNK_ROWS = 50` rows *and* at most `INSERT_CHUNK_CHARS` (~768 KB) of bound
-parameters, because DBSQL rejects a statement whose parameters total more than
-1 MiB and one long body can exhaust that on its own. Logging is the stdlib
+`INSERT_CHUNK_ROWS = 50` rows *and* at most `INSERT_CHUNK_CHARS` (768 KiB) of bound
+UTF-8 bytes, because DBSQL rejects a statement whose parameters total more than 1 MiB
+and one long body can exhaust that on its own. Bytes, not characters: a comment body
+is user text, and an emoji is four. Logging is the stdlib
 `logging` module (no `print`); per-post progress is `DEBUG` and each run emits
 per-phase summaries at `INFO`, controlled by `LOG_LEVEL` (default `INFO`).
 
 Two consequences worth knowing:
 
-- Because the delete is scoped to the window and the source is a bounded fetch, a
-  post or comment that ages out of the source while still inside the window is
-  deleted and not re-inserted unless the fetch still returns it.
-- The DELETE and INSERT are separate autocommitted statements, so a failure
-  between them leaves the window rows absent rather than restoring the previous
-  snapshot. A retry re-fetches and rewrites the window.
+- A post that ages out of both listings simply stops being refreshed. Its row stays,
+  so the raw tables accumulate history; nothing prunes them on a schedule.
+- The DELETE and INSERT are separate autocommitted statements, so a failure between
+  them leaves that chunk's ids absent rather than restoring the previous rows. The
+  interleaving is what bounds the damage: a chunk of at most 5,000 ids, all of them
+  fetched by the run that failed, so the next run re-fetches and rewrites them. A
+  single delete pass followed by one insert pass would have stranded every id at once,
+  including rows older than the 26-hour read window that no later run can reach.
 
 The entrypoints `raise` on failure instead of calling `sys.exit(1)`. A raised
 exception is what makes Dagster record the asset materialization as failed, which is
@@ -196,11 +210,11 @@ the state the retry policy acts on; `sys.exit` ends the process without the asse
 being retried.
 
 `orchestration/src/reddit_pipeline_orchestration/definitions.py` turns the three
-extractors into Python assets — `reddit_raw/r_worldnews`, `reddit_raw/r_comments`,
+extractors into Python assets — `reddit_raw/r_posts`, `reddit_raw/r_comments`,
 `reddit_raw/r_users` — and adds one `@dbt_assets` definition, `dbt_reddit`. Each
 extractor asset carries the key Dagster derives for its `reddit_raw` source, so the
 source spec merges into it and the staging models depend on the loads. Comments and
-users declare `deps=[RAW_POSTS_KEY]` because they derive from the same hot posts, so
+users declare `deps=[RAW_POSTS_KEY]` because they derive from the same post listings, so
 the graph runs posts → comments/users → dbt. The single `dbt_reddit` asset runs
 `dbt build` through `DbtCliResource` against the repo-owned `profiles/` directory:
 with no `--select` that builds and tests every model, so the marts are rebuilt against
@@ -221,11 +235,24 @@ dagster asset materialize -m reddit_pipeline_orchestration.definitions --select 
 
 ### Scheduling
 
-There is no schedule, matching the Prefect deployment, which was triggered on demand.
-To add one, define a stopped `dg.ScheduleDefinition` for the `reddit_refresh` job in
-`definitions.py` and add it to `dg.Definitions(schedules=[...])`; it stays inert until
-switched on in the UI. Until then a run is started from the UI or `dagster asset
-materialize`, so nothing writes to the warehouse on its own.
+One schedule: `daily_edition_refresh`, cron `0 5 * * *` UTC, driving the
+`reddit_refresh` job. It ships **stopped**, matching `daily_job_board_refresh` in the
+sibling project, so a deployment does not write to the warehouse until someone flips
+it in the UI. Until then a run is started from the UI or `dagster asset materialize`.
+
+The cadence is daily because the `daily/` marts are incremental on `edition_date`: a
+second build inside the same day replaces that day's page rather than appending to it,
+so the app reads exactly one snapshot per day. 05:00 UTC sits after the American
+evening and before the European morning, which is when the widest set of the previous
+day's stories has been posted.
+
+The extractors read the **whole seed**: `seeds/sections.csv` is both the section
+map and the ingest list, so adding a subreddit is a one-line seed change that cannot
+drift between ingest and marts. Each subreddit costs two listing requests — `new`
+for what is being posted now, `top(day)` for what has already earned its place — and
+both land in `workspace.topic_raw.r_posts`. Comments cover the 200 most-commented
+in-window posts only, because comment fetching is one request per post; users are
+capped at 200 profiles. The seed's `weight` column is still unused by any model.
 
 ## Macros
 
@@ -245,13 +272,13 @@ under a `view` the expression is evaluated per query, so it reports query time
 rather than load time. Add further audit columns inside the macro and every model
 that calls it picks them up.
 
-All three marts — `mart_comment_history`, `mart_post_summary` and
-`mart_user_metrics` — call `add_audit_fields()`. sqlfluff resolves the macro
+All eight marts — the three original ones and the five in `models/marts/reddit/daily/`
+— call `add_audit_fields()`. sqlfluff resolves the macro
 because `.sqlfluff` sets `load_macros_from_path = macros`; without it, linting a
 model that calls the macro fails on an undefined macro.
 
-`macros/window_hours.sql` defines `window_hours()`, which returns `5` — the
-dbt-side definition of the ingestion rolling window. `mart_comment_history` uses
+`macros/window_hours.sql` defines `window_hours()`, which returns `26` — the
+dbt-side definition of the ingestion read window. `mart_comment_history` uses
 it as `interval {{ window_hours() }} hours`, so the SQL window and
 `INCREMENTAL_WINDOW_HOURS` in `ingestion/reddit/_common.py` stay in step;
 `tests/test_window_contract.py` renders the macro and asserts the two agree.
@@ -260,6 +287,12 @@ It is a macro rather than a dbt `var` on purpose: sqlfluff's jinja templater stu
 `var()` with a placeholder token, which makes that `interval` expression
 unparsable and fails `sqlfluff lint`. A macro renders normally through
 `load_macros_from_path`. The value has no second definition in `dbt_project.yml`.
+
+`macros/story_domain.sql` defines `story_domain(column)`, the publishing domain of a
+story link reduced to its first label — `bbc`, `pravda`, `cnbc`. A self post's url is
+its own reddit.com permalink, which is not an outlet, so it collapses to the empty
+string rather than to `reddit`. Used by `mart_daily_edition`, which carries the result
+through to the section summary's lead story.
 
 ## Linting, type checking, debugging
 
@@ -331,7 +364,7 @@ directory per skill, discovered non-recursively by the `agents` provider:
 | --- | --- |
 | `lint-and-typecheck` | toolchain commands, config, intentional rule deviations, PATH pitfalls |
 | `dbt-model-conventions` | layer responsibilities and materialisation, naming, sources, the project macros, test placement, remaining structural gaps |
-| `reddit-extraction` | entrypoints and the Dagster job, what each extractor loads, `.env`, the shared `_common.py` scaffolding, the rolling-window loads for posts/comments and the key-based upsert for users, stubbing recipe for offline tests |
+| `reddit-extraction` | entrypoints and the Dagster job, what each extractor loads, `.env`, the shared `_common.py` scaffolding, the 26-hour read filter, the key-based upsert all three loads share, stubbing recipe for offline tests |
 
 Check what is discovered:
 ```bash

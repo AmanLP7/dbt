@@ -1,5 +1,5 @@
 with source as (
-    select * from {{ source('reddit_raw', 'r_worldnews') }}
+    select * from {{ source('reddit_raw', 'r_posts') }}
 ),
 
 cleaned as (

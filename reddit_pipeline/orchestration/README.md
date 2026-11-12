@@ -51,17 +51,17 @@ than a copy.
 One job, four assets, in this order because the later ones read what the earlier ones
 write:
 
-1. **`reddit_raw/r_worldnews`** (Python, group `ingestion`, kinds
+1. **`reddit_raw/r_posts`** (Python, group `ingestion`, kinds
    `python`/`databricks`) — calls `extract_posts()` and returns `rows_written`.
 2. **`reddit_raw/r_comments`** (Python) — calls `extract_comments()`; depends on the
    posts load, which it derives from.
 3. **`reddit_raw/r_users`** (Python) — calls `extract_users()`; depends on the posts
    load for the same reason.
-4. **`dbt_reddit`** (dbt) — one `dbt build` (staging → intermediate → marts → tests)
-   through `DbtCliResource`, yielding the eight dbt assets.
+4. **`dbt_reddit`** (dbt) — one `dbt build` (seeds → staging → intermediate → marts →
+   tests) through `DbtCliResource`, yielding the fifteen dbt assets.
 
 Each extractor asset is declared under the asset key Dagster derives for its dbt
-source (`<source_name>/<table_name>`, e.g. `reddit_raw/r_worldnews`), so the two
+source (`<source_name>/<table_name>`, e.g. `reddit_raw/r_posts`), so the two
 definitions merge and the extractor becomes the upstream of `stg_reddit_posts`. That
 merge is what makes one run extract and then build instead of doing either half
 alone.
@@ -73,11 +73,11 @@ retry policy: three retries on an exponential backoff with jitter.
 
 | Kind | Count | Names |
 | --- | --- | --- |
-| Assets | 11 | `reddit_raw/r_worldnews`, `reddit_raw/r_comments`, `reddit_raw/r_users`, `stg_reddit_posts`, `stg_reddit_comments`, `stg_reddit_users`, `int_posts_enriched`, `int_comments_enriched`, `mart_post_summary`, `mart_user_metrics`, `mart_comment_history` |
-| Asset checks | 28 | every dbt test declared on the eight models |
-| Asset groups | 2 | `ingestion` (the extractors), `transformation` (the eight dbt assets) |
+| Assets | 18 | `reddit_raw/r_posts`, `reddit_raw/r_comments`, `reddit_raw/r_users`, `sections`, `trending_stopwords`, `stg_reddit_posts`, `stg_reddit_comments`, `stg_reddit_users`, `int_posts_enriched`, `int_comments_enriched`, `mart_post_summary`, `mart_user_metrics`, `mart_comment_history`, `mart_daily_edition`, `mart_daily_section_summary`, `mart_daily_trending_terms`, `mart_daily_reading_list`, `mart_subreddit_daily_volume` |
+| Asset checks | 70 | every dbt test declared on the fifteen models and two seeds |
+| Asset groups | 2 | `ingestion` (the extractors), `transformation` (the fifteen dbt assets) |
 | Job | 1 | `reddit_refresh` = `AssetSelection.all()` |
-| Schedules | 0 | none — Prefect was triggered on demand, and the port keeps it that way |
+| Schedules | 1 | `daily_edition_refresh` (cron `0 5 * * *`, UTC), shipped **stopped** |
 
 Groups are assigned in `definitions.py`: `group_name="ingestion"` on the extractor
 assets, and `RedditDbtTranslator.get_group_name()` returning `transformation` for
@@ -86,7 +86,7 @@ because each `reddit_raw.r_*` source shares its asset key with an extractor and 
 second group on that key would conflict with `ingestion`. Both groups are selectable:
 `dg.AssetSelection.groups("ingestion")` / `.groups("transformation")`.
 
-`enable_asset_checks=True` turns the 28 model tests into checks on their models.
+`enable_asset_checks=True` turns the declared tests into checks on their models and seeds.
 `enable_source_tests_as_checks=True` is set so that any test later declared on the
 `reddit_raw` source attaches to its extractor rather than being silently dropped.
 
@@ -158,7 +158,7 @@ hand with `dbt build`).
 Two modules in the offline suite cover this layer:
 
 - `tests/test_definitions.py`: the code location's wiring — the asset set, the
-  extractor→staging merges, the retry policy, all 28 asset checks, the job's
-  selection, and the absence of a schedule.
+  extractor→staging merges, the retry policy, all 70 asset checks, the job's
+  selection, and the single schedule shipping stopped.
 - `tests/test_extract_assets.py`: each extractor asset — the `rows_written`
   materialization metadata and failure propagation.
