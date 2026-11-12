@@ -1,0 +1,7 @@
+# Development-only tooling. Not needed to run the loader or dbt models.
+# Install into the active Python environment:
+#   pip install -r requirements-dev.txt
+ruff==0.17.0
+sqlfluff==4.4.0
+pyright==1.1.414
+pytest==8.4.2

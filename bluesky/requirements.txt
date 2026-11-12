@@ -1,0 +1,17 @@
+# Runtime dependencies for the Bluesky pipeline.
+#   pip install -r requirements.txt
+# Dev/lint tooling is separate: requirements-dev.txt
+#
+# Install into the active Python environment, not as a `uv tool`: ~/.local/bin
+# precedes the pyenv shims, so tool copies would shadow the environment's
+# `dbt`/`python`.
+#
+#   databricks-sql-connector  -> import databricks.sql  (the batched INSERTs)
+#   databricks-sdk            -> import databricks.sdk  (profile credentials)
+#   python-dotenv             -> import dotenv  (loads .env in _common.py)
+databricks-sql-connector==4.4.0
+databricks-sdk==0.117.0
+python-dotenv==1.2.4
+
+# dbt and the Databricks adapter, for the models layered on the raw table.
+dbt-databricks==1.12.6

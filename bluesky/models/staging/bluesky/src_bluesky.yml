@@ -1,0 +1,65 @@
+version: 2
+
+sources:
+  - name: bluesky_raw
+    database: workspace
+    schema: bluesky
+    # `main.events` in kafka_streams/bluesky/data/bluesky.db, copied verbatim by
+    # ingestion/bluesky/load_events.py. Every column is text except the three
+    # counters, matching what the Flink JDBC sink stores; typing happens in
+    # models/staging.
+    config:
+      # `ingested_at` lands as STRING verbatim, and `collect_freshness` needs a
+      # timestamp back: an uncast STRING raises UnexpectedNonTimestampError.
+      loaded_at_field: "cast(ingested_at as timestamp)"
+      freshness:
+        warn_after: {count: 6, period: hour}
+        error_after: {count: 24, period: hour}
+    tables:
+      - name: raw_bluesky
+        description: >
+          Bluesky Jetstream events appended from the local SQLite sink. Append-only
+          and delivered **at least once**: a batch whose INSERT committed but whose
+          acknowledgement was lost is re-sent by the next run, so `(partition,
+          offset)` is the only safe key and `seq` is unique per event. `offset` is
+          the per-partition Kafka position the loader resumes from.
+        columns:
+          - name: record_key
+            description: "AT URI of the record the event belongs to; empty for events that name none"
+            data_type: STRING
+          - name: ingested_at
+            description: "ISO-8601 time the event reached the SQLite sink; the freshness heartbeat"
+            data_type: STRING
+          - name: event_dt
+            description: "ISO-8601 event time from the Jetstream frame; the table is clustered on it"
+            data_type: STRING
+          - name: event_kind
+            description: "commit, identity or account"
+            data_type: STRING
+          - name: collection
+            description: "AT Protocol collection, e.g. app.bsky.feed.post"
+            data_type: STRING
+          - name: did
+            description: "Decentralised identifier of the account that emitted the event"
+            data_type: STRING
+          - name: operation
+            description: "create, update or delete, for commit events only"
+            data_type: STRING
+          - name: rkey
+            description: "Record key within the collection"
+            data_type: STRING
+          - name: seq
+            description: "Jetstream's own per-event counter; unique per event"
+            data_type: BIGINT
+          - name: topic
+            description: "Kafka topic the event was consumed from"
+            data_type: STRING
+          - name: partition
+            description: "Kafka partition"
+            data_type: INT
+          - name: offset
+            description: "Kafka offset; the loader's resume point is MAX(offset) per partition"
+            data_type: BIGINT
+          - name: payload
+            description: "The Jetstream event body, verbatim JSON"
+            data_type: STRING

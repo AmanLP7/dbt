@@ -1,0 +1,28 @@
+# Bluesky Jetstream project: raw event landing (Python, `ingestion/`) plus the
+# dbt models layered on top of it. The project is named after its single source,
+# matching the sibling `reddit_pipeline`/`job_postings` layout.
+name: 'bluesky'
+version: '1.0.0'
+
+# Which profile dbt uses; the repo-owned profile lives in profiles/profiles.yml
+# and is symlinked to ./profiles.yml so a bare `dbt` in this directory finds it.
+profile: 'bluesky'
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+# dbt collects only `.sql` files from test-paths, so the pytest suite in `tests/`
+# (test_*.py, conftest.py, fakes.py) is invisible to it and the two share the
+# directory without interfering.
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# Materialisation is keyed by the directory under models/ and is inherited by
+# source-named subdirectories (models/staging/bluesky/, ...). No layer has a model
+# yet — the first one lands `staging: +materialized: view`, `intermediate: view`
+# and `marts: table` here, since dbt warns about paths that configure nothing.

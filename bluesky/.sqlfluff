@@ -1,0 +1,33 @@
+[sqlfluff]
+# Databricks SQL is the warehouse behind this project (dbt-databricks).
+dialect = databricks
+# Jinja, not dbt: linting must not require a warehouse connection or profile.
+templater = jinja
+ignore_paths = target, dbt_packages, logs
+large_file_skip_byte_limit = 0
+max_line_length = 120
+
+[sqlfluff:templater:jinja]
+# Resolve {{ ref() }}, {{ source() }}, {{ config() }} and {{ var() }} as stubs
+# rather than failing on undefined variables.
+apply_dbt_builtins = True
+# Resolve project macros the same way dbt does.
+load_macros_from_path = macros
+
+[sqlfluff:rules:capitalisation.keywords]
+capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.identifiers]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.functions]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.literals]
+capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.types]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:aliasing.table]
+aliasing = implicit
