@@ -23,17 +23,28 @@
 #
 # The read-only guarantee is therefore the caller's identity, not a tool name:
 #
-#   1. `.omp/mcp.json` sends `Authorization: Bearer <token>` for the service
+#   1. `.omp/mcp.json` declares a **stdio** server, not an HTTP one: it runs
+#      `~/.config/omp/dbsql-mcp-bridge.py`, which forwards each JSON-RPC frame to
+#      the endpoint with `Authorization: Bearer <token>` for the service
 #      principal `omp-dbsql-ro` (applicationId 2848e97e-e449-400f-9088-c33275d535d0).
-#      The header is produced per connection by `~/.config/omp/dbsql-token.py`,
-#      which mints an OAuth M2M token (client_credentials, scope `all-apis`) from
-#      the client secret in `~/.config/omp/dbsql-client.json` (mode 600, expires
-#      2028-10-23) and caches it in `~/.config/omp/.dbsql-token-cache` for its
-#      one-hour life. It is not the caller's identity, so no human token reaches
-#      the server.
+#      The token comes from `~/.config/omp/dbsql-token.py`, which mints an OAuth
+#      M2M token (client_credentials, scope `all-apis`) from the client secret in
+#      `~/.config/omp/dbsql-client.json` (mode 600, expires 2028-10-23) and
+#      caches it in `~/.config/omp/.dbsql-token-cache` for its one-hour life. It
+#      is not the caller's identity, so no human token reaches the server.
+#
+#      The relay exists because OMP resolves a `!command` header value once and
+#      process-caches the string: an HTTP entry with
+#      `"Authorization": "!$HOME/.config/omp/dbsql-token.py"` works until the
+#      first token ages out an hour later, and then every request is `401 access
+#      token expired` — `/mcp reconnect` and `/mcp reload` both replay the
+#      startup string. The relay keeps the header in memory only until 5 minutes
+#      before its `exp` and re-mints once on a 401. `/mcp reload` is still what
+#      picks up a change to `mcp.json`.
 #   2. That principal holds exactly: USE_CATALOG on `workspace`; USE_SCHEMA and
 #      SELECT on `workspace.job_postings`, `workspace.reddit`,
-#      `workspace.topic_raw`; CAN_USE on warehouse `5c5d597ca7af9460`. It has no
+#      `workspace.topic_raw`, `workspace.bluesky`; CAN_USE on warehouse
+#      `5c5d597ca7af9460`. It has no
 #      CREATE/INSERT/UPDATE/DELETE/MODIFY anywhere, so a write fails in Unity
 #      Catalog with `PERMISSION_DENIED`, whatever the MCP tool set allows.
 #      `system` and `system.ai` access is inherited from its `account users`

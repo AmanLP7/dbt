@@ -2,12 +2,9 @@
   "$schema": "https://raw.githubusercontent.com/can1357/oh-my-pi/main/packages/coding-agent/src/config/mcp-schema.json",
   "mcpServers": {
     "databricks": {
-      "type": "http",
-      "url": "https://dbc-280fcd4a-642e.cloud.databricks.com/ai-gateway/mcp-services/system.ai.dbsql",
-      "timeout": 120000,
-      "headers": {
-        "Authorization": "!$HOME/.config/omp/dbsql-token.py"
-      }
+      "type": "stdio",
+      "command": "/home/aman_lp7/.config/omp/dbsql-mcp-bridge.py",
+      "timeout": 120000
     }
   }
 }
