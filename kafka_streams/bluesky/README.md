@@ -362,8 +362,19 @@ metadata columns.
 dialects for Derby, MySQL, PostgreSQL, Oracle, Db2, SQL Server, CrateDB,
 OceanBase, and Trino — not SQLite. `lib/sqlite-dialect/` is a `JdbcDialect`
 subclass that registers itself through `META-INF/services` and emits
-`INSERT OR IGNORE`. The two flows carry identical copies; nothing loads them but
-their own `flink_job.py`.
+`INSERT OR IGNORE`. Each flow carries its own copy in its own `lib/`; nothing
+loads them but that flow's `flink_job.py`.
+
+**Why a compiled driver too.** The stock `org.sqlite.JDBC` runs in auto-commit
+mode, and `executeBatch()` commits every statement separately — one WAL fsync
+each. Measured on this box: 100 rows/s for a 500-row batch, against 24,252 rows/s
+for the same rows inside one transaction. Flink's JDBC sink never calls
+`setAutoCommit(false)` and its connector exposes no option for it, so
+`BatchedSqliteDriver` (same jar, same package tree) wraps each `executeBatch()` in
+one transaction and commits at the end. `sink_ddl()` names it in the sink's
+`'driver'` option. A failed batch rolls back rather than half-applying, and the
+sink stays at-least-once because `INSERT OR IGNORE` absorbs a replay. The
+Wikimedia flow still uses the stock driver.
 
 **Why `seq` is BIGINT.** It is ~2.65e10 today, seven times past `INT`. `offset`
 is BIGINT for the same reason at a lower threshold, and because `heal_cursor`
@@ -405,6 +416,15 @@ part that varies, and only when 8082 is taken.
 - `BLUESKY_FLINK_REST_PORT` overrides the base port; the job tries ten
   consecutive ports from there and logs which one it got. 8082, not 8081, so both
   flows' jobs can run at once.
+- **From a Windows browser, use `http://localhost:8082`, not
+  `http://127.0.0.1:8082`.** WSL publishes the port through `wslrelay`, which
+  listens on the IPv6 loopback only; `netstat -ano | findstr :8082` on Windows
+  shows `[::1]:8082` and no IPv4 entry, so `127.0.0.1` is refused while
+  `localhost` (which resolves to `::1` first) works. Inside WSL both work.
+- A job URL dies with the process: the MiniCluster, and the dashboard with it,
+  live inside the `flink_job` Python process. Every start mints a new job id, and
+  an old `/#/job/<id>/overview` link returns 404 on the new job's dashboard. Take
+  the URL from the `Dashboard:` log line rather than reusing a saved one.
 - The counters are only meaningful while the JVM lives; the durable answer is
   `SELECT COUNT(*), MAX(offset) FROM events` in SQLite.
 - `/checkpoints` reads all zeros. The job does not use Flink checkpoints: its
@@ -439,10 +459,14 @@ same variables; its batch bounds, retries, and parallelism are constants in
   a week. Size the volume before leaving it running.
 - **Reconnect.** Every 30 minutes on a timer, and on any socket error after a
   `(1, 5, 15, 30, 60)` s backoff. Both resume from `main.jetstream_cursor`.
-- **Batch.** The Flink sink flushes on 500 rows or 1 s, retrying a failed batch
-  three times. The producer persists its cursor every 500 events and once on the
-  way out — at 300 events/s a write per event would be a SQLite transaction per
-  message.
+- **Batch.** The Flink sink flushes on 5,000 rows or 1 s, retrying a failed batch
+  three times, and each flush is one SQLite transaction. Measured 2026-10-28 with
+  the firehose at ~450–470 msg/s: 3,800–4,200 rows/s while draining a backlog, and
+  459 rows/s once at the live edge against a 448 msg/s firehose — i.e. parity, lag
+  held at a couple of thousand messages. Before the batching driver the same sink
+  managed 139–169 rows/s and the backlog grew without bound. The producer persists
+  its cursor every 500 events and once on the way out — at 300 events/s a write per
+  event would be a SQLite transaction per message.
 - **Stopping the Flink job.** Stop the Python process *and its JVM*: `kill` the
   process group (or Ctrl-C in the foreground) rather than one PID. Measured
   2026-10-28: `SIGKILL` of the Python parent took the JVM with it within 3 s —

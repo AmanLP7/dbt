@@ -195,6 +195,13 @@ def sink_ddl(db_path: Path) -> str:
 
     No primary key is declared: the sink is append-only and the duplicate
     suppression happens in SQLite, not in Flink's upsert machinery.
+
+    `driver` names the SQLite driver in this flow's jar, which commits once per
+    `sink.buffer-flush` batch. The stock driver commits every statement in a
+    batch separately, and each commit fsyncs the WAL: 100 rows/s against 24,252
+    rows/s for the same rows in one transaction, measured on this machine. That
+    is the difference between falling behind a ~450 msg/s firehose and keeping
+    up with it, and Flink's JDBC sink has no option of its own to ask for it.
     """
     columns = ",\n  ".join(f"{_quote(name)} {flink_column(name, sql_type)}" for name, sql_type in EVENT_COLUMNS.items())
     # The JVM resolves a relative `jdbc:sqlite:` path against its own cwd, which
@@ -205,9 +212,10 @@ CREATE TEMPORARY TABLE events_sink (
   {columns}
 ) WITH (
   'connector' = 'jdbc',
+  'driver' = 'org.apache.flink.connector.jdbc.sqlite.database.jdbc.BatchedSqliteDriver',
   'url' = 'jdbc:sqlite:{url}',
   'table-name' = 'events',
-  'sink.buffer-flush.max-rows' = '500',
+  'sink.buffer-flush.max-rows' = '5000',
   'sink.buffer-flush.interval' = '1s',
   'sink.max-retries' = '3'
 )
