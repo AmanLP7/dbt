@@ -2,11 +2,9 @@
 
 Four tasks, in dependency order:
 
-1. ``reddit_raw/r_posts/<subreddit>`` (Python, one asset per row of
-   ``seeds/sections.csv``) — fetch that subreddit's new and top-of-day posts into a
-   per-run SQLite dump, so each load is separately visible, retryable and failable
-   in the UI. ``reddit_raw/r_posts`` is the barrier those loads feed: it lands the
-   dumped posts into ``workspace.topic_raw.r_posts`` via COPY INTO.
+1. ``reddit_raw/r_posts`` (Python + Databricks) — fetch every seeded subreddit's
+   new and top-of-day posts into a per-run SQLite dump, then COPY INTO
+   ``workspace.topic_raw.r_posts``.
 2. ``reddit_raw/r_comments`` (Python + Databricks) — fetch the top comments of the
    most-commented in-window posts into the SQLite dump, then COPY INTO
    ``workspace.topic_raw.r_comments``.
@@ -64,10 +62,9 @@ from ingestion.reddit._common import (  # noqa: E402
     connect_sqlite,
     databricks_token,
     ensure_sqlite_table,
-    subreddit_list,
 )
 from ingestion.reddit.copy_into import copy_into_raw  # noqa: E402
-from ingestion.reddit.extract_reddit import extract_posts_for  # noqa: E402
+from ingestion.reddit.extract_reddit import extract_posts  # noqa: E402
 from ingestion.reddit.extract_reddit_comments import extract_comments  # noqa: E402
 from ingestion.reddit.extract_reddit_users import extract_users  # noqa: E402
 
@@ -127,24 +124,6 @@ if not DBT_PROJECT.manifest_path.exists() and DBT_PROJECT.preparer is not None:
 RAW_POSTS_KEY = dg.AssetKey(["reddit_raw", "r_posts"])
 RAW_COMMENTS_KEY = dg.AssetKey(["reddit_raw", "r_comments"])
 RAW_USERS_KEY = dg.AssetKey(["reddit_raw", "r_users"])
-
-# The seed is the single source of the subreddit list, so one asset per seeded
-# subreddit is generated from it here rather than repeated in Python: adding a
-# subreddit stays one CSV row, and the graph, the extractor and the marts cannot
-# disagree about which subreddits exist.
-#
-# One asset each, not one asset partitioned by subreddit, because a partitioned
-# asset cannot be materialised by an unpartitioned job: `reddit_refresh` would have
-# to become a partitioned job, and every other asset in it -- the comment and user
-# loads and the whole `dbt build` -- would then run once per partition. Separate
-# assets keep one run covering everything in order, while the UI still lists each
-# subreddit load as its own element with its own status, retry and failure.
-SUBREDDIT_NAMES = subreddit_list()
-
-
-def posts_key(name: str) -> dg.AssetKey:
-    """The asset key of one subreddit's posts, under the key the dbt source merges into."""
-    return dg.AssetKey([*RAW_POSTS_KEY.path, name])
 
 
 # dbt's tests become Dagster asset checks: every test declared on a model or a seed
@@ -223,51 +202,23 @@ class RedditSqlite(dg.ConfigurableResource):
         return self._connection
 
 
-def posts_asset(name: str) -> dg.AssetsDefinition:
-    """The posts load for one seeded subreddit, as its own asset node.
-
-    Built per subreddit rather than declared 66 times: the body is identical and
-    only `name` differs, so a loop over the seed keeps the list in one place.
-    """
-
-    @dg.asset(
-        key=posts_key(name),
-        group_name="ingestion",
-        kinds={"python"},
-        retry_policy=RETRY_POLICY,
-        description=(
-            f"r/{name}: its new and top-of-day listings, filtered to the 26-hour read "
-            "window and dumped into the run's SQLite file for COPY INTO."
-        ),
-    )
-    def load(context: dg.AssetExecutionContext, sqlite: RedditSqlite) -> dg.MaterializeResult:
-        rows_written = extract_posts_for(name, sqlite.connection)
-        context.log.info("r/%s: wrote %s posts", name, rows_written)
-        return dg.MaterializeResult(metadata={"subreddit": name, "rows_written": rows_written})
-
-    return load
-
-
-POSTS_ASSETS = [posts_asset(name) for name in SUBREDDIT_NAMES]
-
-
 @dg.asset(
     key=RAW_POSTS_KEY,
-    deps=[posts_key(name) for name in SUBREDDIT_NAMES],
     group_name="ingestion",
     kinds={"python", "databricks"},
     retry_policy=RETRY_POLICY,
     description=(
-        "Every seeded subreddit's posts are in the run's SQLite dump. This node "
-        "lands the dumped posts into workspace.topic_raw.r_posts via COPY INTO, so "
-        "it materializes only after every per-subreddit load succeeded."
+        "Every seeded subreddit's new and top-of-day posts, fetched whole-seed into "
+        "the run's SQLite dump and landed into workspace.topic_raw.r_posts via "
+        "COPY INTO."
     ),
 )
-def raw_reddit_posts(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
-    """Task 1: land the dumped posts into workspace.topic_raw.r_posts via COPY INTO."""
+def raw_reddit_posts(context: dg.AssetExecutionContext, sqlite: RedditSqlite) -> dg.MaterializeResult:
+    """Task 1: fetch every seeded subreddit's posts, dump them to SQLite, and COPY INTO."""
+    rows_written = extract_posts(sqlite.connection)
     result = copy_into_raw(tables=("r_posts",))
     context.log.info("Landed %s posts via COPY INTO", result.rows.get("r_posts", 0))
-    return dg.MaterializeResult(metadata={"rows_landed": result.rows})
+    return dg.MaterializeResult(metadata={"rows_written": rows_written, "rows_landed": result.rows})
 
 
 @dg.asset(
@@ -349,7 +300,6 @@ daily_edition_refresh = dg.ScheduleDefinition(
 
 defs = dg.Definitions(
     assets=[
-        *POSTS_ASSETS,
         raw_reddit_posts,
         raw_reddit_comments,
         raw_reddit_users,

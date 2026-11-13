@@ -1,11 +1,11 @@
 """Contracts of the Dagster wrappers around the extractors.
 
-Each `raw_reddit_*` asset is a thin adapter: call its entrypoint once (where it has
-one), publish the returned row count as the `rows_written` materialization metadata,
-land the dump with one `copy_into_raw` call for its own table, and let a failure
-escape so the run fails instead of looking like a successful zero-row fetch. The
-entrypoints and `copy_into_raw` are replaced at the definitions module attribute and
-the SQLite resource is faked, so neither Reddit nor Databricks is touched here.
+Each `raw_reddit_*` asset is a thin adapter: call its entrypoint once, publish the
+returned row count as the `rows_written` materialization metadata, land the dump with
+one `copy_into_raw` call for its own table, and let a failure escape so the run fails
+instead of looking like a successful zero-row fetch. The entrypoints and
+`copy_into_raw` are replaced at the definitions module attribute and the SQLite
+resource is faked, so neither Reddit nor Databricks is touched here.
 """
 
 from __future__ import annotations
@@ -16,22 +16,17 @@ from reddit_pipeline_orchestration import definitions as d
 
 ROWS_WRITTEN = 4242
 
-# One posts asset per seeded subreddit, so the graph is generated from the seed: the
-# sample below is the first node, and `test_definitions.py` pins that all 66 exist.
-POSTS_ASSET = d.POSTS_ASSETS[0]
-POSTS_SUBREDDIT = d.SUBREDDIT_NAMES[0]
-
-# `subreddit` is the name a per-subreddit load must fetch; the comment and user loads
-# are whole-seed. Every load takes the run's shared SQLite connection.
+# Every load takes the run's shared SQLite connection; there is no per-subreddit
+# split, so each raw asset fetches the whole seed once.
 EXTRACTORS = [
-    (POSTS_ASSET, "extract_posts_for", POSTS_SUBREDDIT),
+    (d.raw_reddit_posts, "extract_posts", None),
     (d.raw_reddit_comments, "extract_comments", None),
     (d.raw_reddit_users, "extract_users", None),
 ]
 IDS = ["posts", "comments", "users"]
 
-# The three raw assets each land their own table with one `copy_into_raw` call: the
-# posts barrier does no fetching of its own, while comments and users fetch first.
+# The three raw assets each land their own table with one `copy_into_raw` call after
+# fetching their rows into the shared SQLite dump.
 COPY_TABLES = [
     (d.raw_reddit_posts, "r_posts"),
     (d.raw_reddit_comments, "r_comments"),
@@ -75,23 +70,18 @@ def test_asset_materializes_the_extractor_row_count(
         return ROWS_WRITTEN
 
     monkeypatch.setattr(d, entrypoint, fake_extract)
-    # Comments and users also land their dump after fetching; stub that out so only
-    # the extractor call is what this test observes.
+    # Every raw asset also lands its dump after fetching; stub that out so only the
+    # extractor call is what this test observes.
     monkeypatch.setattr(d, "copy_into_raw", lambda **kwargs: FakeCopyResult({}))
 
     result = dg.materialize([asset], resources=resources())
 
     assert result.success is True
     assert len(calls) == 1, "the asset calls the extractor exactly once per materialization"
-    expected = (subreddit, CONN) if subreddit is not None else (CONN,)
-    assert calls[0] == expected, (
-        "the load runs on the run's shared SQLite connection, and a per-subreddit load fetches only its own subreddit"
-    )
+    assert calls[0] == (CONN,), "the load runs on the run's shared SQLite connection"
     materializations = result.asset_materializations_for_node(asset.node_def.name)
     assert len(materializations) == 1
     assert materializations[0].metadata["rows_written"].value == ROWS_WRITTEN
-    if subreddit is not None:
-        assert materializations[0].metadata["subreddit"].value == subreddit
 
 
 @pytest.mark.parametrize(("asset", "entrypoint", "subreddit"), EXTRACTORS, ids=IDS)
@@ -130,7 +120,8 @@ def test_raw_asset_lands_its_own_table_via_copy_into(
         return FakeCopyResult({table: ROWS_WRITTEN})
 
     monkeypatch.setattr(d, "copy_into_raw", fake_copy_into)
-    # Comments and users fetch before they COPY INTO; the posts barrier only lands.
+    # Every raw asset fetches before it COPY INTOs.
+    monkeypatch.setattr(d, "extract_posts", lambda con: ROWS_WRITTEN)
     monkeypatch.setattr(d, "extract_comments", lambda con: ROWS_WRITTEN)
     monkeypatch.setattr(d, "extract_users", lambda con: ROWS_WRITTEN)
 

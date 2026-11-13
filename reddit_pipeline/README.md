@@ -15,7 +15,7 @@ This dbt project is designed to transform and model Reddit data on Databricks.
 - `models/marts/reddit/daily/`: the daily edition. `mart_daily_edition` (ranked stories per section), `mart_daily_section_summary`, `mart_daily_trending_terms`, `mart_daily_reading_list`, `mart_subreddit_daily_volume`. All five are `incremental` on `edition_date` with `delete+insert`, so each run replaces the last three editions and every older edition survives the raw tables rolling. The edition date is the story's own creation date, not the build date, so rebuilding reproduces the same paper.
 - Each layer keeps its models in a source-named subfolder — currently `reddit/`, so a second source can sit beside it: `models/staging/reddit/`, `models/intermediate/reddit/`, `models/marts/reddit/`. The layer's materialisation in `dbt_project.yml` is inherited by the subfolder.
 - `ingestion/reddit/`: the Python extractors that fetch Reddit data and dump it into a local SQLite run database, plus `copy_into.py`, which lands that dump in Databricks via `COPY INTO` — one module per entity, with `_common.py` holding the scaffolding they share (constants, env validation, clients, table setup, the SQLite dump and the COPY INTO machinery). Like the model layers, `ingestion/` groups extractors into a source-named subpackage — currently `reddit/`; `ingestion/__init__.py` and `ingestion/reddit/__init__.py` are package markers.
-- `orchestration/`: the Dagster code location (`reddit_pipeline_orchestration.definitions`). Per-subreddit posts loads plus three raw assets (`reddit_raw/r_posts`, `reddit_raw/r_comments`, `reddit_raw/r_users`) that each dump then land their own table via `COPY INTO`, and one dbt-assets definition, merged into a single graph by asset key; see [Orchestration](#orchestration).
+- `orchestration/`: the Dagster code location (`reddit_pipeline_orchestration.definitions`). Three raw assets (`reddit_raw/r_posts`, `reddit_raw/r_comments`, `reddit_raw/r_users`) that each dump then land their own table via `COPY INTO`, and one dbt-assets definition, merged into a single graph by asset key; see [Orchestration](#orchestration).
 - `tests/`: the offline pytest suite — `conftest.py` fixtures, `fakes.py` test doubles, and the extractor/definitions/asset/window-contract tests. No network and no warehouse.
 - `profiles/profiles.yml`: the repo-owned dbt profile (see Quick Start).
 - `seeds/sections.csv`: maps a subreddit to its newspaper section (`world`, `politics`, `business`, `tech`, `science`, `sports`, `culture`, `discussion`) plus a weight. A subreddit absent from the seed still prints, under `other`; the seed decides the front page's shape, not whether a subreddit is ingested.
@@ -224,17 +224,14 @@ extractors into Python assets — `reddit_raw/r_posts`, `reddit_raw/r_comments`,
 `reddit_raw/r_users` — each of which dumps its rows and then lands its own table via
 `COPY INTO`, plus one `@dbt_assets` definition, `dbt_reddit`.
 
-Posts are **one asset per subreddit** — `reddit_raw/r_posts/<name>`, generated from
-`seeds/sections.csv`, so the UI shows 66 separate loads rather than a single opaque
-step: each can be materialised alone, retried alone, and a subreddit that is private,
-banned or rate-limited fails alone. Each calls `extract_posts_for(name, sqlite.connection)`
-and shares one SQLite connection per run (the `RedditSqlite` resource — one fresh
-`data/reddit.db` per run). Because that file has a single writer, `reddit_refresh`
-pins `in_process_executor` so the loads run sequentially in one process rather than
-fanning out across workers. `reddit_raw/r_posts` stays as the barrier they
-all feed: it lands the dumped posts into `workspace.topic_raw.r_posts` via `COPY INTO`
-once every per-subreddit load has succeeded; `extract_posts()` remains the
-whole-seed path for `python -m ingestion.reddit.extract_reddit`. Each
+`reddit_raw/r_posts` is **one asset for the whole seed**. It calls
+`extract_posts(sqlite.connection)` — `extract_posts()` is now the only posts
+entrypoint, no `extract_posts_for` per-subreddit variant — harvesting every
+subreddit in `seeds/sections.csv` into the `RedditSqlite` resource's fresh
+per-run `data/reddit.db`, then lands the dumped posts into
+`workspace.topic_raw.r_posts` via `COPY INTO`. Because the SQLite file has a single
+writer, `reddit_refresh` pins `in_process_executor` so the whole run stays
+sequential in one process rather than fanning out across workers. Each
 extractor asset carries the key Dagster derives for its `reddit_raw` source, so the
 source spec merges into it and the staging models depend on the loads. Comments and
 users declare `deps=[RAW_POSTS_KEY]` because they derive from the same post listings, so
@@ -249,10 +246,9 @@ dbt step authenticates with a token minted from the same Databricks CLI profile 
 extractors use (`databricks_token()` in `ingestion/reddit/_common.py`) at the start of
 each run, immediately before `dbt` is invoked; passing a token is deliberate, because
 dbt-databricks' own `auth_type: oauth` is a browser flow that cannot complete
-unattended. The per-subreddit loads, `reddit_raw/r_comments`, `reddit_raw/r_users`
-and `dbt_reddit` carry a three-retry policy with exponential backoff and jitter,
-ported from the Prefect tasks, so a transient failure is retried before the run
-fails.
+unattended. The three extractor assets and `dbt_reddit` carry a three-retry policy
+with exponential backoff and jitter, ported from the Prefect tasks, so a transient
+failure is retried before the run fails.
 
 Run the whole pipeline once, headless, from `orchestration/`:
 
@@ -261,8 +257,8 @@ dagster job execute -m reddit_pipeline_orchestration.definitions --job reddit_re
 ```
 
 Run the *job*, not `asset materialize`: an ad-hoc asset selection uses the default
-multiprocess executor, which fans the per-subreddit loads across workers and races on
-the shared SQLite dump. `reddit_refresh` pins `in_process_executor`.
+multiprocess executor, which races on the shared SQLite dump. `reddit_refresh` pins
+`in_process_executor`.
 
 ### Scheduling
 

@@ -185,7 +185,7 @@ commenter profiles — plus a daily "newspaper" mart layer built from them.
 | `seeds/sections.csv` | `subreddit, section, weight` — the newspaper's section map. A subreddit the seed omits still prints, under `other`. |
 | `seeds/trending_stopwords.csv` | Words dropped from titles before the trending mart counts them. |
 | `ingestion/reddit/` | One module per entity plus `_common.py`: clients, env validation, table setup, the seed-driven subreddit list, and the SQLite dump + COPY INTO machinery; `copy_into.py` lands the dump in the raw tables. |
-| `orchestration/` | Dagster code location `reddit_pipeline_orchestration.definitions`: job `reddit_refresh`, 17 assets (3 extractors + `copy_into` + 13 dbt), 70 asset checks, one schedule `daily_edition_refresh` (cron `0 5 * * *` UTC, ships stopped). |
+| `orchestration/` | Dagster code location `reddit_pipeline_orchestration.definitions`: job `reddit_refresh`, 18 assets (3 extractors + 2 seeds + 13 dbt), 70 asset checks, one schedule `daily_edition_refresh` (cron `0 5 * * *` UTC, ships stopped). |
 | `macros/` | `add_audit_fields()`, `window_hours()` (the dbt-side 26-hour read window), `story_domain()` (outlet label from a post url). |
 | `tests/` | Offline pytest: extractors, Dagster wiring, extractor assets, window contract. |
 | `.agents/skills/` | Skills `lint-and-typecheck`, `dbt-model-conventions`, `reddit-extraction`; list them from this directory with `omp skill list`. |
@@ -203,8 +203,9 @@ commenter profiles — plus a daily "newspaper" mart layer built from them.
   skipped, not fatal.
 - **All three loads dump to SQLite, then `COPY INTO`.** Extractors write their
   fetched rows into a local SQLite run database (`data/reddit.db` by default, env
-  `REDDIT_SQLITE_PATH`); `copy_into.py` (or the orchestrated `raw_copy_into` asset)
-  exports the dump as NDJSON, uploads it to the Unity Catalog volume
+  `REDDIT_SQLITE_PATH`); `copy_into.py` (or each orchestrated extractor asset,
+  which calls `copy_into_raw()` after dumping) exports the dump as NDJSON, uploads
+  it to the Unity Catalog volume
   `workspace.topic_raw.staging` (env `REDDIT_VOLUME`), and runs append-only
   `COPY INTO` into the raw tables. No upsert or DELETE is ever needed: the staging
   models already dedupe by id, and `ingested_at` is cast back to `TIMESTAMP` by the

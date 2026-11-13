@@ -56,8 +56,8 @@ def _write_posts(
 ) -> int:
     """Keep the submissions inside the read window and dump them to SQLite.
 
-    Returns the number of rows written. Shared by the whole-seed load and the
-    per-subreddit load so both apply the same window and the same dump.
+    Returns the number of rows written. Shared by the orchestrated load and the
+    hand-run load so both apply the same window and the same dump.
     """
     fetched_count = len(submissions)
     inside_window = [submission for submission in submissions if submission.created_utc >= cutoff]
@@ -71,52 +71,16 @@ def _write_posts(
     return dump_rows(con, SQLITE_TABLE, POSTS_COLUMNS, rows, replace=replace)
 
 
-def extract_posts_for(name: str, con: sqlite3.Connection | None = None) -> int:
-    """Fetch one subreddit's listings and dump its posts to SQLite.
-
-    One subreddit per call so each is a separate unit of work the orchestrator can
-    materialise, retry and observe on its own: a subreddit that is private, banned
-    or rate-limited fails this call without touching the others. Returns the
-    number of rows written.
-
-    `con` is the caller's already-open SQLite connection, with the table already
-    created. The orchestrator opens one connection per run and shares it across
-    the per-subreddit loads. Omitted, this opens and closes its own, which is what
-    a hand run does.
-    """
-    validate_env()
-    cutoff = window_cutoff()
-    stamped_at = load_timestamp()
-
-    logger.info("Fetching new and top-of-day posts from r/%s...", name)
-    reddit = reddit_client()
-    # A single name here, so `harvest_submissions` cannot swallow the failure: an
-    # unreadable subreddit raises out of the listing call and fails this load.
-    submissions, failed = harvest_submissions(reddit, [name])
-    if failed:
-        raise RuntimeError(f"Could not read r/{name}; see the log for the API error")
-
-    if con is None:
-        own_con = connect_sqlite()
-        try:
-            ensure_sqlite_table(own_con, SQLITE_TABLE, POSTS_COLUMNS)
-            written = _write_posts(own_con, submissions, cutoff, stamped_at, replace=True)
-        finally:
-            own_con.close()
-    else:
-        written = _write_posts(con, submissions, cutoff, stamped_at)
-
-    logger.info("r/%s: %d posts written.", name, written)
-    return written
-
-
-def extract_posts() -> int:
+def extract_posts(con: sqlite3.Connection | None = None) -> int:
     """Fetch posts from every subreddit in the seed and dump them into SQLite.
 
     The whole-seed path, kept for `python -m ingestion.reddit.extract_reddit`: one
-    API client and one SQLite connection for all the seeded subreddits, where the
-    orchestrator instead calls :func:`extract_posts_for` once per subreddit.
-    Returns the number of post rows written.
+    API client and one SQLite connection for all the seeded subreddits. `con` is the
+    caller's already-open connection, with the table already created; the orchestrator
+    opens one connection per run and shares it across the loads, and the dump is
+    appended without `replace`. Omitted, this opens and closes its own connection,
+    resetting the table first — what a hand run does. Returns the number of post rows
+    written.
     """
     validate_env()
 
@@ -139,15 +103,15 @@ def extract_posts() -> int:
     # One load-time timestamp for every row of this run
     stamped_at = load_timestamp()
 
-    logger.info("Opening SQLite run database...")
-    con = connect_sqlite()
-    try:
-        ensure_sqlite_table(con, SQLITE_TABLE, POSTS_COLUMNS)
-        logger.info("Dumping data into %s...", SQLITE_TABLE)
-        written = _write_posts(con, submissions, cutoff, stamped_at, replace=True)
-        logger.info("Data dump complete: %d posts written.", written)
-    finally:
-        con.close()
+    if con is None:
+        own_con = connect_sqlite()
+        try:
+            ensure_sqlite_table(own_con, SQLITE_TABLE, POSTS_COLUMNS)
+            written = _write_posts(own_con, submissions, cutoff, stamped_at, replace=True)
+        finally:
+            own_con.close()
+    else:
+        written = _write_posts(con, submissions, cutoff, stamped_at)
 
     return written
 

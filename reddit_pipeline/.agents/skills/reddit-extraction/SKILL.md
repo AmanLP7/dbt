@@ -43,9 +43,8 @@ warehouse where dbt has never run. The dbt models declare their own dependencies
 the manifest, so they are not hand-listed in the job. `reddit_refresh` is a job over
 `AssetSelection.all()`; its one schedule is `daily_edition_refresh` (cron
 `0 5 * * *`, UTC), which ships **stopped**, so nothing writes on its own until it is
-turned on in the UI. The per-subreddit loads, `reddit_raw/r_comments`,
-`reddit_raw/r_users` and `dbt_reddit` carry three retries with an exponential
-backoff plus jitter, ported from the Prefect tasks. See
+turned on in the UI. The three extractor assets and `dbt_reddit` carry three
+retries with an exponential backoff plus jitter, ported from the Prefect tasks. See
 `orchestration/README.md` for the full graph, commands and deployment notes.
 
 **Credentials are shared.** The dbt asset does not rely on dbt's own auth:

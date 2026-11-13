@@ -49,24 +49,20 @@ than a copy.
 ## The four tasks
 
 One job, in this order because the later ones read what the earlier ones write.
-The job pins `in_process_executor`: the 66 per-subreddit loads share one SQLite
-file, which has a single writer, so they run sequentially in one process. The
-default multiprocess executor would fan them out across workers, and each worker
-would `reset=True` (unlink and recreate) the shared file under the others —
-failing with `attempt to write a readonly database`.
+The job pins `in_process_executor`: SQLite has a single writer, so the whole run
+stays sequential in one process. The default multiprocess executor would fan the
+assets out across workers, and each worker would `reset=True` (unlink and
+recreate) the shared file under the others — failing with
+`attempt to write a readonly database`.
 
-1. **`reddit_raw/r_posts/<subreddit>`** (Python, group `ingestion`, kinds `python`) —
-   one asset per row of `seeds/sections.csv` (66 today), generated in a loop over the
-   seed. Each calls `extract_posts_for(name, sqlite.connection)` and returns
-   `rows_written` plus the subreddit, so the UI lists every subreddit load as its own
-   element: it can be materialised alone, its retry and failure are scoped to that
-   subreddit, and a private or rate-limited subreddit no longer takes the other 65
-   down with it. The 66 loads share one SQLite connection (the `RedditSqlite`
-   resource, one fresh `data/reddit.db` per run); extractors no longer talk to the
-   warehouse, they dump into that database. **`reddit_raw/r_posts`** (Python +
-   Databricks) is the barrier all 66 feed: it materialises only once every
-   per-subreddit load has succeeded, then calls `copy_into_raw(tables=("r_posts",))`
-   to land the dumped posts into `workspace.topic_raw.r_posts`.
+1. **`reddit_raw/r_posts`** (Python + Databricks, group `ingestion`, kinds
+   `python` + `databricks`) — one asset for the whole seed. It calls
+   `extract_posts(sqlite.connection)` to harvest every subreddit named in
+   `seeds/sections.csv` into the SQLite run database, returns `rows_written`,
+   then calls `copy_into_raw(tables=("r_posts",))` to land the dumped posts into
+   `workspace.topic_raw.r_posts`. The extractors no longer talk to the warehouse
+   directly — they dump into the `RedditSqlite` resource's fresh per-run
+   `data/reddit.db`, and the asset's COPY INTO exports that dump.
 2. **`reddit_raw/r_comments`** (Python + Databricks) — calls
    `extract_comments(sqlite.connection)` then `copy_into_raw(tables=("r_comments",))`
    to land the comments into `workspace.topic_raw.r_comments`; depends on the posts
@@ -76,7 +72,7 @@ failing with `attempt to write a readonly database`.
    land the users into `workspace.topic_raw.r_users`; depends on the posts load for
    the same reason.
 4. **`dbt_reddit`** (dbt) — one `dbt build` (seeds → staging → intermediate → marts →
-   tests) through `DbtCliResource`, yielding the fifteen dbt assets.
+   tests) through `DbtCliResource`, yielding thirteen dbt models plus the two seeds.
 
 Each raw asset is declared under the asset key Dagster derives for its dbt source
 (`<source_name>/<table_name>`, e.g. `reddit_raw/r_posts`), so the two definitions
@@ -84,17 +80,16 @@ merge and the load that lands each table becomes the upstream of its staging mod
 That merge is what makes one run extract and then build instead of doing either half
 alone.
 
-The per-subreddit loads, `reddit_raw/r_comments`, `reddit_raw/r_users` and
-`dbt_reddit` carry the ported Prefect retry policy: three retries on an exponential
-backoff with jitter.
+The three extractor assets and `dbt_reddit` carry the ported Prefect retry policy:
+three retries on an exponential backoff with jitter.
 
 ## Assets, checks, job, schedules
 
 | Kind | Count | Names |
 | --- | --- | --- |
-| Assets | 84 | `reddit_raw/r_posts` (barrier), `reddit_raw/r_posts/<subreddit>` × 66, `reddit_raw/r_comments`, `reddit_raw/r_users`, `sections`, `trending_stopwords`, `stg_reddit_posts`, `stg_reddit_comments`, `stg_reddit_users`, `int_posts_enriched`, `int_comments_enriched`, `mart_post_summary`, `mart_user_metrics`, `mart_comment_history`, `mart_daily_edition`, `mart_daily_section_summary`, `mart_daily_trending_terms`, `mart_daily_reading_list`, `mart_subreddit_daily_volume` |
-| Asset checks | 70 | every dbt test declared on the fifteen models and two seeds |
-| Asset groups | 2 | `ingestion` (the per-subreddit loads and the three raw assets), `transformation` (the fifteen dbt assets) |
+| Assets | 18 | `reddit_raw/r_posts`, `reddit_raw/r_comments`, `reddit_raw/r_users`, `sections`, `trending_stopwords`, `stg_reddit_posts`, `stg_reddit_comments`, `stg_reddit_users`, `int_posts_enriched`, `int_comments_enriched`, `mart_post_summary`, `mart_user_metrics`, `mart_comment_history`, `mart_daily_edition`, `mart_daily_section_summary`, `mart_daily_trending_terms`, `mart_daily_reading_list`, `mart_subreddit_daily_volume` |
+| Asset checks | 70 | every dbt test declared on the thirteen models and two seeds |
+| Asset groups | 2 | `ingestion` (the three extractor assets), `transformation` (the fifteen dbt assets) |
 | Job | 1 | `reddit_refresh` = `AssetSelection.all()` |
 | Schedules | 1 | `daily_edition_refresh` (cron `0 5 * * *`, UTC), shipped **stopped** |
 
@@ -119,8 +114,8 @@ dagster dev
 
 # Headless: run the reddit_refresh job once, no UI. Go through the *job*, not
 # `asset materialize`: an ad-hoc asset selection builds a job with the default
-# multiprocess executor, which fans the per-subreddit loads across workers and
-# races on the shared SQLite file. `reddit_refresh` pins `in_process_executor`.
+# multiprocess executor, which races on the shared SQLite file.
+# `reddit_refresh` pins `in_process_executor`.
 dagster job execute -m reddit_pipeline_orchestration.definitions --job reddit_refresh
 ```
 
