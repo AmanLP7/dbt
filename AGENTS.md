@@ -184,8 +184,8 @@ commenter profiles — plus a daily "newspaper" mart layer built from them.
 | `models/marts/reddit/daily/` | The daily edition: `mart_daily_edition`, `mart_daily_section_summary`, `mart_daily_trending_terms`, `mart_daily_reading_list`, `mart_subreddit_daily_volume` — all incremental on `edition_date`, `delete+insert`, last three editions each run. Tests and descriptions in `daily.yml`. |
 | `seeds/sections.csv` | `subreddit, section, weight` — the newspaper's section map. A subreddit the seed omits still prints, under `other`. |
 | `seeds/trending_stopwords.csv` | Words dropped from titles before the trending mart counts them. |
-| `ingestion/reddit/` | One module per entity plus `_common.py`: clients, env validation, table setup, the seed-driven subreddit list, and the key-based upsert all three loaders share. |
-| `orchestration/` | Dagster code location `reddit_pipeline_orchestration.definitions`: job `reddit_refresh`, 16 assets (3 extractors + 13 dbt), 70 asset checks, one schedule `daily_edition_refresh` (cron `0 5 * * *` UTC, ships stopped). |
+| `ingestion/reddit/` | One module per entity plus `_common.py`: clients, env validation, table setup, the seed-driven subreddit list, and the SQLite dump + COPY INTO machinery; `copy_into.py` lands the dump in the raw tables. |
+| `orchestration/` | Dagster code location `reddit_pipeline_orchestration.definitions`: job `reddit_refresh`, 17 assets (3 extractors + `copy_into` + 13 dbt), 70 asset checks, one schedule `daily_edition_refresh` (cron `0 5 * * *` UTC, ships stopped). |
 | `macros/` | `add_audit_fields()`, `window_hours()` (the dbt-side 26-hour read window), `story_domain()` (outlet label from a post url). |
 | `tests/` | Offline pytest: extractors, Dagster wiring, extractor assets, window contract. |
 | `.agents/skills/` | Skills `lint-and-typecheck`, `dbt-model-conventions`, `reddit-extraction`; list them from this directory with `omp skill list`. |
@@ -201,18 +201,26 @@ commenter profiles — plus a daily "newspaper" mart layer built from them.
   `top(100, day)`), deduped by post id, so ~132 requests per posts run against a
   6,000/hour budget. A subreddit that cannot be read is logged at `WARNING` and
   skipped, not fatal.
-- **All three loads are key-based upserts**, `DELETE WHERE id IN (…)` in chunks then
-  a batched insert. No delete is ever scoped by time: two daily runs through bounded
-  listings cover different spans of the same day, so a `created_utc >= cutoff` delete
-  would drop rows the run never refetched. `INCREMENTAL_WINDOW_HOURS = 26` is a
-  **read** filter only. It is 26, not 24, because a daily cadence landing a minute
-  late would otherwise leave a gap; `window_hours.sql` and the constant must move
-  together or `test_window_contract.py` fails.
+- **All three loads dump to SQLite, then `COPY INTO`.** Extractors write their
+  fetched rows into a local SQLite run database (`data/reddit.db` by default, env
+  `REDDIT_SQLITE_PATH`); `copy_into.py` (or the orchestrated `raw_copy_into` asset)
+  exports the dump as NDJSON, uploads it to the Unity Catalog volume
+  `workspace.topic_raw.staging` (env `REDDIT_VOLUME`), and runs append-only
+  `COPY INTO` into the raw tables. No upsert or DELETE is ever needed: the staging
+  models already dedupe by id, and `ingested_at` is cast back to `TIMESTAMP` by the
+  COPY selection so source freshness still works. No delete is ever scoped by time:
+  two daily runs through bounded listings cover different spans of the same day, so a
+  `created_utc >= cutoff` delete would drop rows the run never refetched.
+  `INCREMENTAL_WINDOW_HOURS = 26` is a **read** filter only. It is 26, not 24,
+  because a daily cadence landing a minute late would otherwise leave a gap;
+  `window_hours.sql` and the constant must move together or `test_window_contract.py`
+  fails.
 - Comments cover only the 200 most-commented in-window posts (comment fetching is
   one request per post); users are capped at 200 profiles, taken from post authors
   first and comment authors only if that falls short.
-- The DELETE and INSERT are separate statements, so a failure between them leaves
-  those ids absent; a retry re-fetches and rewrites them.
+- `COPY INTO` is append-only and runs only after the dump is staged, so a failed
+  load never removes a row that was already there; the staging dedupe absorbs any
+  repeated ids.
 - 4 of the 70 asset checks are `relationships` tests marked `severity: warn`, so a
   green build does not prove referential integrity.
 - The daily marts are keyed on `edition_date` = the **story's own creation date**, not
@@ -469,7 +477,7 @@ Run from the project directory. `dbt build` writes to the warehouse; the write g
 | Install | `pip install -r requirements.txt -r requirements-dev.txt -e orchestration` | same |
 | Parse (no warehouse) | `DBT_PROFILES_DIR=profiles dbt parse` | same |
 | Build + test | `DBT_PROFILES_DIR=profiles dbt build` | same |
-| Extract/load only | `python -m ingestion.jobs.fetch_job_postings` | `python -m ingestion.reddit.extract_reddit`, `…_comments`, `…_users` |
+| Extract/load only | `python -m ingestion.jobs.fetch_job_postings` | `python -m ingestion.reddit.extract_reddit`, `…_comments`, `…_users`, then `python -m ingestion.reddit.copy_into` |
 | Orchestrated run | `dagster asset materialize -m job_postings_orchestration.definitions --select '*'` | `dagster asset materialize -m reddit_pipeline_orchestration.definitions --select '*'` |
 | UI + scheduler | `dagster dev` (from `orchestration/`) | `dagster dev` (from `orchestration/`) |
 | Offline tests | `pytest` | `pytest` |

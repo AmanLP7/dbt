@@ -1,6 +1,6 @@
 ---
 name: reddit-extraction
-description: Running, debugging, or smoke-testing the three Reddit extraction modules, the shared `_common.py` scaffolding they rely on, the Dagster code location that orchestrates them (three extractor assets merged into the dbt sources, then one `dbt build` asset) — what each loads into Databricks, the function entrypoints and the raise-not-sys.exit rule retries depend on, the required .env variables, the seed-driven subreddit list, the 26-hour read window, the key-based upsert all three loads share, the single parameterised insert path, the trailing `ingested_at` column, the missing runtime dependencies, and how to exercise the modules end to end without network or credentials using stubbed clients.
+description: Running, debugging, or smoke-testing the three Reddit extraction modules, the shared `_common.py` scaffolding they rely on, the `copy_into.py` loader that lands their SQLite dump in Databricks, and the Dagster code location that orchestrates them (extractor assets merged into the dbt sources, three raw assets that each dump then COPY INTO their own table, then one `dbt build` asset) — what each dumps into the local SQLite run database and how `COPY INTO` lands it, the function entrypoints and the raise-not-sys.exit rule retries depend on, the required .env variables, the seed-driven subreddit list, the 26-hour read window, the SQLite dump and append-only `COPY INTO` load all three share, the trailing `ingested_at` column, the missing runtime dependencies, and how to exercise the modules end to end without network or credentials using stubbed clients.
 globs: ["ingestion/reddit/**/*.py", "orchestration/**/*.py", "tests/**/*.py"]
 ---
 
@@ -12,11 +12,11 @@ Each extractor is an importable module exposing a single function entrypoint:
 
 | Module | Entrypoint | Returns |
 | --- | --- | --- |
-| `ingestion/reddit/extract_reddit.py` | `extract_posts()` | post rows written |
-| `ingestion/reddit/extract_reddit_comments.py` | `extract_comments()` | comment rows written |
-| `ingestion/reddit/extract_reddit_users.py` | `extract_users()` | user rows written |
+| `ingestion/reddit/extract_reddit.py` | `extract_posts()` | post rows dumped to SQLite |
+| `ingestion/reddit/extract_reddit_comments.py` | `extract_comments()` | comment rows dumped to SQLite |
+| `ingestion/reddit/extract_reddit_users.py` | `extract_users()` | user rows dumped to SQLite |
 
-Importing a module loads `.env` and nothing else; all Reddit API and Databricks
+Importing a module loads `.env` and nothing else; all Reddit API and SQLite
 work happens inside the entrypoint. Each module is runnable directly, where
 `__main__` calls `configure_logging()` and then its entrypoint, so both paths
 behave the same:
@@ -30,19 +30,21 @@ imports) must be run from the repo root.
 
 `orchestration/src/reddit_pipeline_orchestration/definitions.py` imports the three
 and wraps each in a Dagster asset — `reddit_raw/r_posts`,
-`reddit_raw/r_comments`, `reddit_raw/r_users` — plus one `@dbt_assets` definition,
-`dbt_reddit`. Comments and users declare `deps=[RAW_POSTS_KEY]`, so the job runs
-posts -> comments/users -> dbt (comments and users derive from the same post listings,
-so the order matters). Each extractor asset is declared under the asset key Dagster
-derives for its `reddit_raw.r_*` source, so the source spec merges into the extractor
-and the staging models depend on the loads. `dbt_reddit` runs
+`reddit_raw/r_comments`, `reddit_raw/r_users` — each of which dumps its rows and then
+COPY INTOs its own table, plus one `@dbt_assets` definition, `dbt_reddit`. Comments
+and users declare `deps=[RAW_POSTS_KEY]`, so the job runs
+posts -> comments/users -> dbt (comments and users derive from the same
+post listings, so the order matters). Each extractor asset is declared under the asset
+key Dagster derives for its `reddit_raw.r_*` source, so the source spec merges into
+the extractor and the staging models depend on the loads. `dbt_reddit` runs
 `dbt build --profiles-dir profiles` from the repo root through `DbtCliResource`; with
 no `--select` that builds and tests every model in the project, so the step works on a
 warehouse where dbt has never run. The dbt models declare their own dependencies from
 the manifest, so they are not hand-listed in the job. `reddit_refresh` is a job over
 `AssetSelection.all()`; its one schedule is `daily_edition_refresh` (cron
 `0 5 * * *`, UTC), which ships **stopped**, so nothing writes on its own until it is
-turned on in the UI. All four assets carry three retries with an exponential
+turned on in the UI. The per-subreddit loads, `reddit_raw/r_comments`,
+`reddit_raw/r_users` and `dbt_reddit` carry three retries with an exponential
 backoff plus jitter, ported from the Prefect tasks. See
 `orchestration/README.md` for the full graph, commands and deployment notes.
 
@@ -77,20 +79,23 @@ Everything the three extractors used to duplicate lives here:
 - helpers: `validate_env()`, `reddit_client()`, `connect()`, `full_table()`,
   `subreddit_list()`, `subreddit_listings()`, `harvest_submissions()`,
   `row_values()`, `window_cutoff()`, `load_timestamp()`, `ensure_table()`,
-  `ensure_columns()`, `replace_by_key()`, `configure_logging()`, plus a module
-  `logger`.
+  `ensure_columns()`, `configure_logging()`, plus the SQLite dump path
+  (`connect_sqlite()`, `ensure_sqlite_table()`, `dump_rows()`) and the COPY INTO
+  machinery (`copy_selection()`, `copy_into_statement()`, `export_ndjson()`,
+  `VolumeFiles`), plus a module `logger`.
 
 The extractors import these by name; they own no I/O of their own (no `praw`, no
 `sql` call outside `_common`). Public entrypoints are unchanged: each returns
-`int`, the number of rows written.
+`int`, the number of rows dumped to SQLite. `copy_into.py` is the second half of the
+load and lives beside the extractors.
 
 ## What each script loads
 
-| Module | Source | Target table | Volume |
+| Module | Source | SQLite table → raw table | Volume |
 | --- | --- | --- | --- |
-| `ingestion/reddit/extract_reddit.py` | every seeded subreddit: `new(limit=100)` + `top(limit=100, time_filter='day')` | `workspace.topic_raw.r_posts` | 1 row/post, ≤ 13,200 posts |
-| `ingestion/reddit/extract_reddit_comments.py` | the 200 most-commented in-window posts, `comments[:10]` each, `replace_more(limit=0)` | `workspace.topic_raw.r_comments` | ≤ 2,000 rows |
-| `ingestion/reddit/extract_reddit_users.py` | post authors from `new(limit=50)` across the seed, then comment authors if short | `workspace.topic_raw.r_users` | ≤ 200 profiles |
+| `ingestion/reddit/extract_reddit.py` | every seeded subreddit: `new(limit=100)` + `top(limit=100, time_filter='day')` | `r_posts` → `workspace.topic_raw.r_posts` | 1 row/post, ≤ 13,200 posts |
+| `ingestion/reddit/extract_reddit_comments.py` | the 200 most-commented in-window posts, `comments[:10]` each, `replace_more(limit=0)` | `r_comments` → `workspace.topic_raw.r_comments` | ≤ 2,000 rows |
+| `ingestion/reddit/extract_reddit_users.py` | post authors from `new(limit=50)` across the seed, then comment authors if short | `r_users` → `workspace.topic_raw.r_users` | ≤ 200 profiles |
 
 **The subreddit list is the seed.** `subreddit_list()` reads
 `seeds/sections.csv`, the same file that maps a subreddit to its newspaper section,
@@ -100,27 +105,32 @@ posts run against a 6,000/hour budget. A subreddit that cannot be read — priva
 banned, renamed, rate limited — is logged at `WARNING` and skipped rather than
 failing a run that has already spent requests on the others.
 
-Posts are deduped by id across both listings before loading, so a story that is both
+Posts are deduped by id across both listings before dumping, so a story that is both
 new and top-of-day is written once, with the `top` reading's score (that listing runs
 second and carries the fresher number). Comments are fetched only for the most
 commented posts because comment fetching is one request per post.
 
-Each script calls `ensure_table()` (which issues `CREATE CATALOG/SCHEMA/TABLE IF
-NOT EXISTS` before loading) and then `ensure_columns()`.
+Each extractor calls `ensure_sqlite_table()` to create its SQLite table (mapping the
+Databricks column types onto SQLite: `STRING`→`TEXT`, `INT`→`INTEGER`, `DOUBLE`→
+`REAL`, `BOOLEAN`→`INTEGER`, `TIMESTAMP`→`TEXT`) before dumping. `copy_into.py` then
+calls `ensure_table()` (which issues `CREATE CATALOG/SCHEMA/TABLE IF NOT EXISTS`) and
+`ensure_columns()` on the Databricks target before each `COPY INTO`.
 
-Loads are key-based upserts, all three of them:
+Loads are a SQLite dump followed by an append-only `COPY INTO`, all three of them:
 
-- `replace_by_key()` deletes exactly the ids fetched this run (`DELETE FROM <table>
-  WHERE id IN (?, ?, ...)`, chunked at `DELETE_CHUNK_ROWS`) and inserts the fetched
-  rows in batched multi-row statements. The two are **interleaved per chunk** — delete
-  a chunk, insert that chunk, next chunk — not run as two passes over everything.
-  Nothing is ever deleted by time.
+- Each extractor `dump_rows()`es its fetched rows into its SQLite table. A hand-run
+  replaces the table first (`replace=True`); the orchestrated run uses one fresh
+  `data/reddit.db` per run. Nothing is ever deleted from the warehouse: `COPY INTO`
+  appends, so the raw tables accumulate history and the dbt staging models already
+  dedupe by id (`row_number() over (partition by id order by created_utc desc, score
+  desc)`), which is why no upsert or DELETE is needed.
   A time-scoped delete cannot be exact once a run reads many subreddits through
   bounded listings: two consecutive runs cover different spans of the same day, so
-  the second would delete rows the first wrote and never refetch them.
+  the second would delete rows the first wrote and never refetch them. Appending
+  sidesteps that entirely.
 - `INCREMENTAL_WINDOW_HOURS = 26` survives as a **read** filter only:
   `window_cutoff()` computes `time.time() - 26 * 3600` once per run, and fetched
-  rows older than it are dropped before the load. The entrypoint returns the
+  rows older than it are dropped before the dump. The entrypoint returns the
   written count, and logs fetched-versus-kept. 26 rather than 24 because a daily
   cadence with a 24-hour window leaves a gap whenever the run lands a minute late.
 - **Users** carry no window at all: an account's `created_utc` is its account age,
@@ -131,12 +141,10 @@ Loads are key-based upserts, all three of them:
 
 Two consequences, stated honestly:
 
-- The DELETE and INSERT are separate autocommitted statements. A failure between
-  them leaves that chunk's ids absent rather than restoring the previous rows; a
-  retry re-fetches and rewrites them. The interleaving is what keeps the damage to
-  one chunk of at most `DELETE_CHUNK_ROWS` ids — deleting everything first would
-  strand the whole run at once, including rows older than the 26-hour read window
-  that no later run can reach.
+- `COPY INTO` is append-only and runs only after the whole dump has been staged on
+  the volume, so a failed load never removes a row that was already there. If a
+  retry lands the same files again, the staging models dedupe by id; if a later run
+  re-fetches the same ids, the older rows stay and the newer ones win in staging.
 - A post that ages out of both listings simply stops being refreshed. Its row stays,
   so the raw tables accumulate history — nothing prunes them, and `open_listings`-style
   liveness is not what they measure.
@@ -146,21 +154,25 @@ comments the extractor actually saw — those of the posts hot in the rolling
 window — so `mart_post_summary.comments_collected_locally` reflects the
 extraction window, not the post's true comment count (`total_comments_on_reddit`).
 
-## One parameterised insert path
+## One SQLite dump path
 
-All three loaders share a single strategy: `_insert_sql()` builds
-`INSERT INTO <table> (<cols>) VALUES (?, ?, ...)` for a batch and the values travel
-bound. `executemany` is not used — measured at 1.7–2.0 s per row against this
-warehouse. Nothing about a row is interpolated into SQL text — the two
-hand-rolled `escape_str()` helpers that used to build `INSERT`/`WHERE id IN`
-strings for the posts and users loads are gone. The only things ever interpolated
-are identifiers (catalog, schema, table and column names), which cannot be bound.
+All three loaders share a single strategy: `dump_rows()` builds
+`INSERT INTO <table> (<cols>) VALUES (?, ?, ...)` once and the rows travel in one
+`executemany` with `?` parameters. Nothing about a row is interpolated into SQL text
+— the two hand-rolled `escape_str()` helpers that used to build `INSERT`/`WHERE id
+IN` strings for the posts and users loads are gone. The only things ever
+interpolated are identifiers (catalog, schema, table and column names), which cannot
+be bound. SQLite is a local file, so there is no per-row network round trip to
+measure and no multi-row batch bound: `executemany` is exactly right here.
 
-`_insert_rows()` chunks rows into multi-row `INSERT ... VALUES (...), (...)` statements
-under both DBSQL bounds (50 rows, and 768 KiB of bound UTF-8 bytes — measured in
-bytes, not characters, because a comment body is user text and an emoji is four).
-Tests assert the payload never reaches the SQL string: a comment body containing
-`O'Brien; DROP TABLE …; --` travels as a parameter (`tests/test_extractors.py`).
+`copy_into.py` then exports the dump as NDJSON — `export_ndjson()` streams each SQLite
+table into `part-00000.json` files, splitting when a file reaches
+`NDJSON_FILE_BYTES` (~200 MB), and `VolumeFiles` uploads them to the staging volume.
+One `COPY INTO` per table reads those files back out, with `copy_selection()` casting
+each column to its Databricks type (`ingested_at` back to `TIMESTAMP`) so the raw
+tables land typed. Tests assert the payload never reaches the SQL string: a comment
+body containing `O'Brien; DROP TABLE …; --` travels as a bound parameter
+(`tests/test_extractors.py`).
 
 ## Raw table columns and `ingested_at`
 
@@ -172,14 +184,19 @@ supplied. One timestamp is computed per run and stamped on every row.
 `ensure_columns()` additively migrates a table that predates the column: it runs
 `DESCRIBE TABLE`, then one `ALTER TABLE ... ADD COLUMNS (name type)` per missing
 column, and is a no-op when nothing is missing. This is how an already-shipped
-table gains `ingested_at` without a drop-and-recreate.
+table gains `ingested_at` without a drop-and-recreate. On the way in, the SQLite
+dump stores `ingested_at` as `TEXT` (UTC string); the `COPY INTO` SELECT casts it
+back to `TIMESTAMP` (`copy_selection()`), which is what keeps `src_reddit.yml`'s
+`loaded_at_field: ingested_at` freshness working.
 
 ## Environment
 
 `.env` at the project root supplies the required keys `REDDIT_CLIENT_ID`,
 `REDDIT_CLIENT_SECRET`, `REDDIT_USER_AGENT`, `DATABRICKS_HOSTNAME`,
 `DATABRICKS_HTTP_PATH`; the optional `DATABRICKS_CONFIG_PROFILE` (default
-`DEFAULT`) and `LOG_LEVEL` (default `INFO`). `.env.example` is the template and
+`DEFAULT`) and `LOG_LEVEL` (default `INFO`), plus the optional
+`REDDIT_SQLITE_PATH` (default `data/reddit.db`) and `REDDIT_VOLUME` (default
+`workspace.topic_raw.staging`). `.env.example` is the template and
 `.env` is gitignored — never commit it, never print its values. `validate_env()`
 runs first in every entrypoint and raises if any required value is missing or
 still contains the placeholder `your_`.
@@ -225,10 +242,11 @@ each module — so importing a module installs no handler, and tests can assert 
 `databricks.sdk.core`) at module scope but does no network or DB work on import,
 and the extractors touch no I/O directly — so patching `_common` alone is enough.
 Stub the four patch points, then call the entrypoint; this exercises the real
-control flow and lets you capture the SQL actually issued:
+control flow and lets you capture the rows dumped to SQLite:
 
 ```python
 import os
+import sqlite3
 import types
 
 from ingestion.reddit import _common
@@ -238,7 +256,7 @@ for var in _common.REQUIRED_ENV:
     os.environ[var] = f"test-{var.lower()}"
 
 _common.praw.Reddit = lambda **_: FakeReddit()
-_common.sql.connect = lambda **_: FakeConnection()
+_common.connect_sqlite = lambda *a, **k: sqlite3.connect(":memory:")
 _common.time = types.SimpleNamespace(time=lambda: 1_700_000_000.0)
 _common.Config = lambda **_: types.SimpleNamespace(authenticate=lambda: {"Authorization": "Bearer stub"})
 
@@ -246,8 +264,9 @@ extract_posts()
 ```
 
 - `ingestion.reddit._common.praw.Reddit` — the Reddit client factory.
-- `ingestion.reddit._common.sql.connect` — the Databricks connection; return a
-  fake connection whose cursor records `execute`/`executemany`.
+- `ingestion.reddit._common.connect_sqlite` — return an in-memory (or temp-file)
+  SQLite connection; the entrypoint opens its own connection through it, so query
+  `r_posts` afterwards to assert the dumped rows.
 - `ingestion.reddit._common.time` — pin the clock, keeping the real `time` module
   untouched (this is what makes the window cutoff deterministic).
 - `ingestion.reddit._common.Config` — the CLI-profile credential object, so
@@ -255,7 +274,10 @@ extract_posts()
 
 Set the env vars first: the entrypoint validates them as its first step. Fake
 `Submission`/`Comment`/`Author` objects are enough; assert on captured column
-names, tuple widths, row counts, and the bound delete parameters.
+names, tuple widths, and the row counts/values in the SQLite table. To exercise
+the load half without a warehouse, call `copy_into_raw(dry_run=True)` (counts the
+SQLite rows, touches nothing on Databricks) or pass `volume_files=FakeVolumeFiles()`
+to capture the uploads while faking `_common.connect()` and `_common.VolumeFiles`.
 `databricks.sdk.core.Config` is imported at module scope, so stub it unless
 `databricks-sdk` is installed — the captured `sql.connect()` kwargs carry the
 `credentials_provider` factory.

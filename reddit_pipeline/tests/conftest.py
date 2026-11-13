@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 import types
@@ -76,25 +77,40 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> float:
 
 
 @pytest.fixture
-def make_warehouse(monkeypatch: pytest.MonkeyPatch):
-    """Factory for a recording cursor wired into `_common.connect`."""
+def sqlite_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
+    """A real SQLite dump at a temp path, with the three raw tables ready.
 
-    def factory(described_columns: list[str] | None = None) -> FakeCursor:
-        cursor = FakeCursor(described_columns)
-        monkeypatch.setattr(_common.sql, "connect", lambda **_: FakeConnection(cursor))
-        monkeypatch.setattr(
-            _common,
-            "Config",
-            lambda **_: types.SimpleNamespace(authenticate=lambda: {"Authorization": "Bearer stub"}),
-        )
-        return cursor
-
-    return factory
+    The dump is a real file, not an in-memory `:memory:` connection. The
+    whole-seed extractors open their *own* connection through
+    `_common.connect_sqlite()`, which resolves its path from `sqlite_path()` at
+    call time, so setting `REDDIT_SQLITE_PATH` to the temp file is what makes
+    their writes land where this connection can read them — no need to patch
+    `connect_sqlite` (which the extractors import by name anyway).
+    """
+    path = tmp_path / "reddit.db"
+    monkeypatch.setenv(_common.REDDIT_SQLITE_PATH_ENV, str(path))
+    con = _common.connect_sqlite()
+    for table, columns in _common.RAW_TABLE_COLUMNS.items():
+        _common.ensure_sqlite_table(con, table, columns)
+    return con
 
 
 @pytest.fixture
-def warehouse(make_warehouse) -> FakeCursor:
-    return make_warehouse()
+def copy_warehouse(monkeypatch: pytest.MonkeyPatch) -> FakeCursor:
+    """A recording Databricks cursor wired into `_common.connect`, for the COPY loader.
+
+    The COPY loader is the only part of the pipeline that still talks to Databricks:
+    its `connect()` is patched to return a fake connection/cursor pair, and `Config`
+    to a stub that never shells out to the CLI.
+    """
+    cursor = FakeCursor()
+    monkeypatch.setattr(_common.sql, "connect", lambda **_: FakeConnection(cursor))
+    monkeypatch.setattr(
+        _common,
+        "Config",
+        lambda **_: types.SimpleNamespace(authenticate=lambda: {"Authorization": "Bearer stub"}),
+    )
+    return cursor
 
 
 @pytest.fixture

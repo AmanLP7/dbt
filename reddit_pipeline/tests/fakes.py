@@ -1,7 +1,13 @@
-"""Offline test doubles for the extractors: no network, no warehouse."""
+"""Offline test doubles for the extractors and the COPY INTO loader.
+
+No network, no warehouse: the extractors write to a real SQLite dump, and only the
+`copy_into_raw` loader talks to Databricks, through a recording `FakeCursor` and a
+recording `FakeVolumeFiles`.
+"""
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from ingestion.reddit import _common  # noqa: F401  (re-exported for callers' convenience)
@@ -32,20 +38,6 @@ class FakeCursor:
         self.closed = True
 
     @property
-    def deletes(self) -> list[tuple[str, Any]]:
-        return [statement for statement in self.statements if statement[0].startswith("DELETE")]
-
-    @property
-    def inserts(self) -> list[tuple[str, Any]]:
-        return [statement for statement in self.statements if statement[0].startswith("INSERT")]
-
-    def inserted(self, columns: dict[str, str] | list[str]) -> list[tuple[Any, ...]]:
-        """Regroup the bound INSERT parameters back into rows of `columns` width."""
-        width = len(columns)
-        params = [value for _, bound in self.inserts for value in (bound or ())]
-        return [tuple(params[index : index + width]) for index in range(0, len(params), width)]
-
-    @property
     def alters(self) -> list[str]:
         return [sql for sql, _ in self.statements if sql.startswith("ALTER")]
 
@@ -64,6 +56,38 @@ class FakeConnection:
 
     def close(self) -> None:
         self.closed = True
+
+
+class FakeVolumeFiles(_common.VolumeFiles):
+    """Records the Files-API calls the COPY INTO loader makes.
+
+    `list_dirs` answers from a configurable directory tree so a test can plant a
+    stale staging directory and assert it gets cleared; `upload` and `remove_dir`
+    record their arguments for the same assertions.
+
+    Subclasses `_common.VolumeFiles` so it slots into `copy_into_raw`'s
+    `volume_files` parameter; `super().__init__()` is deliberately not called
+    because it constructs a real `WorkspaceClient`, and every public method is
+    overridden here.
+    """
+
+    def __init__(self, dirs: list[str] | None = None) -> None:
+        self.uploads: list[tuple[str, str]] = []  # (remote_path, local_path)
+        self.removed: list[str] = []
+        self.list_calls: list[tuple[str, str]] = []  # (remote_dir, prefix)
+        self._dirs = list(dirs or [])
+        self._client = None  # unused: every public method below is overridden
+
+    def upload(self, remote_path: str, local_path: Path) -> None:
+        self.uploads.append((remote_path, str(local_path)))
+
+    def list_dirs(self, remote_dir: str, *, prefix: str = "") -> list[str]:
+        self.list_calls.append((remote_dir, prefix))
+        return [d for d in self._dirs if d.rsplit("/", 1)[-1].startswith(prefix)]
+
+    def remove_dir(self, remote_dir: str) -> int:
+        self.removed.append(remote_dir)
+        return 0
 
 
 class FakeRedditor:

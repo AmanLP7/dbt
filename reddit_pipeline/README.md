@@ -4,7 +4,7 @@ This dbt project is designed to transform and model Reddit data on Databricks.
 
 ## Architecture & Flow
 1. **Extraction**: Fetch every subreddit named in `seeds/sections.csv` (66 today) with PRAW — each one's `new` and `top(day)` listings, the most-commented posts' comments, and the authors' profiles.
-2. **Load**: Upsert into Databricks Delta by id — a chunked `DELETE WHERE id IN (…)` then a batched insert. All three loaders work this way; a 26-hour read filter decides which fetched rows are worth writing, and nothing is ever deleted by time.
+2. **Load**: Extractors dump their fetched rows into a local SQLite run database (`data/reddit.db` by default), then `copy_into.py` exports that dump as NDJSON, uploads it to a Unity Catalog volume, and runs `COPY INTO` into the three raw tables. Loads are append-only; a 26-hour read filter decides which fetched rows are worth writing, and nothing is ever deleted.
 3. **Transformation (dbt)**: Model and clean raw data into staging, intermediate, and marts layers.
 4. **Orchestration**: a Dagster job runs the extractors in order, then one `dbt build`.
 
@@ -14,8 +14,8 @@ This dbt project is designed to transform and model Reddit data on Databricks.
 - `models/marts/`: Final analytics-ready tables for consumption. `mart_post_summary` and `mart_user_metrics` are rebuilt on every run; the comment-id-grain `mart_comment_history` (which combines `r_comments` with its `r_posts` post context over a 26-hour window) is `incremental` and merges on `comment_id`, so history accumulates instead of being recomputed.
 - `models/marts/reddit/daily/`: the daily edition. `mart_daily_edition` (ranked stories per section), `mart_daily_section_summary`, `mart_daily_trending_terms`, `mart_daily_reading_list`, `mart_subreddit_daily_volume`. All five are `incremental` on `edition_date` with `delete+insert`, so each run replaces the last three editions and every older edition survives the raw tables rolling. The edition date is the story's own creation date, not the build date, so rebuilding reproduces the same paper.
 - Each layer keeps its models in a source-named subfolder — currently `reddit/`, so a second source can sit beside it: `models/staging/reddit/`, `models/intermediate/reddit/`, `models/marts/reddit/`. The layer's materialisation in `dbt_project.yml` is inherited by the subfolder.
-- `ingestion/reddit/`: the Python extractors that fetch Reddit data and load it into Databricks — one module per entity, plus `_common.py` holding the scaffolding they share (constants, env validation, clients, table setup, the key-based upsert). Like the model layers, `ingestion/` groups extractors into a source-named subpackage — currently `reddit/`; `ingestion/__init__.py` and `ingestion/reddit/__init__.py` are package markers.
-- `orchestration/`: the Dagster code location (`reddit_pipeline_orchestration.definitions`). Three extractor assets and one dbt-assets definition, merged into a single graph by asset key; see [Orchestration](#orchestration).
+- `ingestion/reddit/`: the Python extractors that fetch Reddit data and dump it into a local SQLite run database, plus `copy_into.py`, which lands that dump in Databricks via `COPY INTO` — one module per entity, with `_common.py` holding the scaffolding they share (constants, env validation, clients, table setup, the SQLite dump and the COPY INTO machinery). Like the model layers, `ingestion/` groups extractors into a source-named subpackage — currently `reddit/`; `ingestion/__init__.py` and `ingestion/reddit/__init__.py` are package markers.
+- `orchestration/`: the Dagster code location (`reddit_pipeline_orchestration.definitions`). Per-subreddit posts loads plus three raw assets (`reddit_raw/r_posts`, `reddit_raw/r_comments`, `reddit_raw/r_users`) that each dump then land their own table via `COPY INTO`, and one dbt-assets definition, merged into a single graph by asset key; see [Orchestration](#orchestration).
 - `tests/`: the offline pytest suite — `conftest.py` fixtures, `fakes.py` test doubles, and the extractor/definitions/asset/window-contract tests. No network and no warehouse.
 - `profiles/profiles.yml`: the repo-owned dbt profile (see Quick Start).
 - `seeds/sections.csv`: maps a subreddit to its newspaper section (`world`, `politics`, `business`, `tech`, `science`, `sports`, `culture`, `discussion`) plus a weight. A subreddit absent from the seed still prints, under `other`; the seed decides the front page's shape, not whether a subreddit is ingested.
@@ -139,57 +139,69 @@ The three extractors are importable modules in the `ingestion.reddit` package.
 `ingestion/reddit/extract_reddit.py`, `ingestion/reddit/extract_reddit_comments.py`
 and `ingestion/reddit/extract_reddit_users.py` each expose a function entrypoint —
 `extract_posts()`, `extract_comments()`, `extract_users()` — that returns the
-number of rows written; importing a module runs no extraction. Each module is
+number of rows dumped to SQLite; importing a module runs no extraction. Each module is
 still runnable directly, where `__main__` calls its entrypoint and installs the
 logging config:
 ```bash
 python -m ingestion.reddit.extract_reddit
+python -m ingestion.reddit.extract_reddit_comments
+python -m ingestion.reddit.extract_reddit_users
+python -m ingestion.reddit.copy_into
 ```
+The three extractors dump into the SQLite run database; the fourth command exports
+that dump and runs `COPY INTO` to land it in Databricks.
 They live under `ingestion/` rather than under `models/` because dbt treats every
 `.py` file under its model paths as a Python model. Everything the three used to
 duplicate now lives in `ingestion/reddit/_common.py` — the tuning constants, env
-validation, the Reddit and Databricks clients, table setup, and the key-based load
-strategy described below.
+validation, the Reddit and Databricks clients, table setup, and the SQLite dump and
+COPY INTO machinery described below. `ingestion/reddit/copy_into.py` is the second
+half of the load: it exports the dump and lands it in Databricks.
 
-Loads are incremental, not full refreshes, and each writes a trailing
+Loads are append-only, not upserts, and each row carries a trailing
 `ingested_at TIMESTAMP` column stamped at load time (the UTC time the row was
-written, not a value Reddit supplied):
+written, not a value Reddit supplied).
 
-All three loaders are **key-based upserts**: `DELETE FROM <table> WHERE id IN
-(<fetched ids>)` in chunks of 5,000, each chunk's delete immediately followed by that
-chunk's batched insert. A rolling
-window is not used, because a run reads several subreddits through bounded listings
-and two consecutive runs cover different spans of the same day — a
+Each extractor dumps its fetched rows into a local SQLite run database (default
+`data/reddit.db`, overridable with `REDDIT_SQLITE_PATH`) — one table per entity,
+`r_posts`, `r_comments` and `r_users`. A hand-run replaces that table first
+(`replace=True`); the orchestrated run uses a fresh per-run database. Then
+`python -m ingestion.reddit.copy_into` exports each table as NDJSON, uploads the
+files to the Unity Catalog volume `workspace.topic_raw.staging` (overridable with
+`REDDIT_VOLUME`), and runs `COPY INTO` into the matching raw table. Because
+`COPY INTO` appends, nothing is ever deleted: the raw tables accumulate history, and
+the dbt staging models already dedupe by id, so no upsert or DELETE is needed. A
+rolling window is not used, because a run reads several subreddits through bounded
+listings and two consecutive runs cover different spans of the same day — a
 `WHERE created_utc >= <cutoff>` delete would drop rows the run never refetched. The
 window survives only as a *read* filter on the posts and comments loads:
 `INCREMENTAL_WINDOW_HOURS = 26` decides which fetched rows are worth writing, and
-nothing is ever deleted by time. The users load carries no window at all — it upserts
+nothing is ever deleted by time. The users load carries no window at all — it dumps
 whatever profiles the run collected.
 
 26 rather than 24 because the pipeline runs once a day and a 24-hour window landing
-a minute late leaves a gap between consecutive runs. Posts and comments upsert on
-`id`; users upsert on the profile `id`, so a returning user gets refreshed
-karma/gold and a new one is added. Per-author profile failures (suspended, deleted,
-private) are counted, logged at `WARNING`, and reported in the run summary rather
-than swallowed. A post fetched with nothing new inside the window skips both the
-delete and the insert.
+a minute late leaves a gap between consecutive runs. Posts and comments dedupe on
+`id`; users on the profile `id`, so a returning user's refreshed karma/gold lands
+beside the earlier rows and the staging view picks the newest. Per-author profile
+failures (suspended, deleted, private) are counted, logged at `WARNING`, and reported
+in the run summary rather than swallowed. A post fetched with nothing new inside the
+window is skipped and never reaches the dump.
 
-`stg_reddit_*` still dedupes by id. That is the at-least-once case, not the
-expected one: a statement committed whose acknowledgement was lost is retried and
-the rows land twice, and the source tables keep the duplicate rather than pretending
-to be exactly-once.
+`stg_reddit_*` dedupes by id — `row_number() over (partition by id order by
+created_utc desc, score desc)` — which is what makes the append-only raw tables
+safe: every load lands the rows it fetched, and the staging view collapses repeated
+ids to the newest reading. That is exactly-once at read time rather than at write
+time, and it means no upsert or DELETE ever has to touch the raw tables.
 
-Every statement is **parameterised**: every value is bound as a `?` parameter and
-no value is interpolated into SQL text — only identifiers (table/column names) are.
-Rows are batched into multi-row `INSERT ... VALUES (...), (...)` statements rather
-than sent one statement per row: the connector's `executemany` costs a full round
-trip each, measured at 1.7–2.0 s per row against this warehouse, so a 200-user load
-spent five and a half minutes on round trips alone. With batching that same load
-wrote 200 users in 30.5 s, an 11× reduction. Each statement carries at most
-`INSERT_CHUNK_ROWS = 50` rows *and* at most `INSERT_CHUNK_CHARS` (768 KiB) of bound
-UTF-8 bytes, because DBSQL rejects a statement whose parameters total more than 1 MiB
-and one long body can exhaust that on its own. Bytes, not characters: a comment body
-is user text, and an emoji is four. Logging is the stdlib
+Every row travels through SQLite on the way in. `dump_rows()` binds each value as a
+`?` parameter into one `executemany` INSERT — no value is ever interpolated into SQL
+text, only identifiers (table/column names) are. The SQLite types mirror the raw-table
+types (`STRING`→`TEXT`, `INT`→`INTEGER`, `DOUBLE`→`REAL`, `BOOLEAN`→`INTEGER`,
+`TIMESTAMP`→`TEXT`); timestamps are normalised to UTC strings before they are written.
+`copy_into.py` then reads the dump back out as NDJSON (`part-00000.json`, split at
+~200 MB per file), uploads each file to the staging volume, and runs one `COPY INTO`
+per table. Its SELECT casts each column back to its Databricks type — crucially
+`ingested_at` back to `TIMESTAMP`, which is what keeps `src_reddit.yml`'s
+`loaded_at_field: ingested_at` freshness working. Logging is the stdlib
 `logging` module (no `print`); per-post progress is `DEBUG` and each run emits
 per-phase summaries at `INFO`, controlled by `LOG_LEVEL` (default `INFO`).
 
@@ -197,12 +209,10 @@ Two consequences worth knowing:
 
 - A post that ages out of both listings simply stops being refreshed. Its row stays,
   so the raw tables accumulate history; nothing prunes them on a schedule.
-- The DELETE and INSERT are separate autocommitted statements, so a failure between
-  them leaves that chunk's ids absent rather than restoring the previous rows. The
-  interleaving is what bounds the damage: a chunk of at most 5,000 ids, all of them
-  fetched by the run that failed, so the next run re-fetches and rewrites them. A
-  single delete pass followed by one insert pass would have stranded every id at once,
-  including rows older than the 26-hour read window that no later run can reach.
+- `COPY INTO` is append-only and runs after the whole dump is staged, so a failed
+  load never removes a row that was already there. If a retry lands the same files
+  again, the staging models dedupe by id; if a later run re-fetches the same ids,
+  the older rows stay and the newer ones win in staging.
 
 The entrypoints `raise` on failure instead of calling `sys.exit(1)`. A raised
 exception is what makes Dagster record the asset materialization as failed, which is
@@ -211,11 +221,25 @@ being retried.
 
 `orchestration/src/reddit_pipeline_orchestration/definitions.py` turns the three
 extractors into Python assets — `reddit_raw/r_posts`, `reddit_raw/r_comments`,
-`reddit_raw/r_users` — and adds one `@dbt_assets` definition, `dbt_reddit`. Each
+`reddit_raw/r_users` — each of which dumps its rows and then lands its own table via
+`COPY INTO`, plus one `@dbt_assets` definition, `dbt_reddit`.
+
+Posts are **one asset per subreddit** — `reddit_raw/r_posts/<name>`, generated from
+`seeds/sections.csv`, so the UI shows 66 separate loads rather than a single opaque
+step: each can be materialised alone, retried alone, and a subreddit that is private,
+banned or rate-limited fails alone. Each calls `extract_posts_for(name, sqlite.connection)`
+and shares one SQLite connection per run (the `RedditSqlite` resource — one fresh
+`data/reddit.db` per run). `reddit_raw/r_posts` stays as the barrier they
+all feed: it lands the dumped posts into `workspace.topic_raw.r_posts` via `COPY INTO`
+once every per-subreddit load has succeeded; `extract_posts()` remains the
+whole-seed path for `python -m ingestion.reddit.extract_reddit`. Each
 extractor asset carries the key Dagster derives for its `reddit_raw` source, so the
 source spec merges into it and the staging models depend on the loads. Comments and
 users declare `deps=[RAW_POSTS_KEY]` because they derive from the same post listings, so
-the graph runs posts → comments/users → dbt. The single `dbt_reddit` asset runs
+the graph runs posts → comments/users → dbt. Each raw asset calls `copy_into_raw()`
+with its own table, which exports the SQLite dump and runs
+`COPY INTO` into `workspace.topic_raw.{r_posts,r_comments,r_users}`. The single
+`dbt_reddit` asset runs
 `dbt build` through `DbtCliResource` against the repo-owned `profiles/` directory:
 with no `--select` that builds and tests every model, so the marts are rebuilt against
 the rows just loaded and the step works on a warehouse where dbt has never run. The
@@ -223,9 +247,10 @@ dbt step authenticates with a token minted from the same Databricks CLI profile 
 extractors use (`databricks_token()` in `ingestion/reddit/_common.py`) at the start of
 each run, immediately before `dbt` is invoked; passing a token is deliberate, because
 dbt-databricks' own `auth_type: oauth` is a browser flow that cannot complete
-unattended. The four assets carry a three-retry policy with exponential backoff and
-jitter, ported from the Prefect tasks, so a transient failure is retried before the
-run fails.
+unattended. The per-subreddit loads, `reddit_raw/r_comments`, `reddit_raw/r_users`
+and `dbt_reddit` carry a three-retry policy with exponential backoff and jitter,
+ported from the Prefect tasks, so a transient failure is retried before the run
+fails.
 
 Run the whole pipeline once, headless, from `orchestration/`:
 
@@ -364,7 +389,7 @@ directory per skill, discovered non-recursively by the `agents` provider:
 | --- | --- |
 | `lint-and-typecheck` | toolchain commands, config, intentional rule deviations, PATH pitfalls |
 | `dbt-model-conventions` | layer responsibilities and materialisation, naming, sources, the project macros, test placement, remaining structural gaps |
-| `reddit-extraction` | entrypoints and the Dagster job, what each extractor loads, `.env`, the shared `_common.py` scaffolding, the 26-hour read filter, the key-based upsert all three loads share, stubbing recipe for offline tests |
+| `reddit-extraction` | entrypoints and the Dagster job, what each extractor loads, `.env`, the shared `_common.py` scaffolding, the 26-hour read filter, the SQLite dump and COPY INTO load, stubbing recipe for offline tests |
 
 Check what is discovered:
 ```bash

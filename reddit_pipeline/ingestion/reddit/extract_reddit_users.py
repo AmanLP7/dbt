@@ -1,9 +1,11 @@
-"""Collect author profiles from every seeded subreddit and load them into Databricks.
+"""Collect author profiles from every seeded subreddit and dump them into the run's SQLite database.
 
 Importing this module only loads environment variables; all Reddit API and
-Databricks work happens inside :func:`extract_users`, so the module stays
+SQLite work happens inside :func:`extract_users`, so the module stays
 importable and runnable (`python -m ingestion.reddit.extract_reddit_users`).
 """
+
+import sqlite3
 
 from ingestion.reddit._common import (
     TARGET_USER_COUNT,
@@ -12,27 +14,28 @@ from ingestion.reddit._common import (
     USER_POST_WALK_LIMIT,
     USERS_COLUMNS,
     configure_logging,
-    connect,
-    ensure_columns,
-    ensure_table,
-    full_table,
+    connect_sqlite,
+    dump_rows,
+    ensure_sqlite_table,
     load_timestamp,
     logger,
     reddit_client,
-    replace_by_key,
     row_values,
     subreddit_list,
     validate_env,
 )
 
-TABLE = full_table("r_users")
+SQLITE_TABLE = "r_users"
 
 
-def extract_users() -> int:
-    """Extract the run's author profiles and upsert them into Databricks.
+def extract_users(con: sqlite3.Connection | None = None) -> int:
+    """Extract the run's author profiles and dump them into SQLite.
 
-    Returns the number of user rows written. The load is key-based on `id`, so a
-    user seen again this run replaces its previous row rather than duplicating it.
+    Returns the number of user rows written. Each author appears once per run.
+
+    `con` is the caller's already-open SQLite connection, with the table already
+    created. Omitted, this opens and closes its own, which is what a hand run
+    does.
     """
     validate_env()
 
@@ -136,18 +139,17 @@ def extract_users() -> int:
     stamped_at = load_timestamp()
     rows = [row_values(USERS_COLUMNS, {**user, "ingested_at": stamped_at}) for user in users]
 
-    logger.info("Connecting to Databricks...")
-    connection, cursor = connect()
-    try:
-        ensure_table(cursor, TABLE, USERS_COLUMNS)
-        ensure_columns(cursor, TABLE, USERS_COLUMNS)
-        logger.info("Ingesting user data into %s...", TABLE)
-        written = replace_by_key(cursor, TABLE, USERS_COLUMNS, rows, "id")
-        logger.info("User data ingestion complete: %d users written.", written)
-    finally:
-        cursor.close()
-        connection.close()
+    if con is None:
+        own_con = connect_sqlite()
+        try:
+            ensure_sqlite_table(own_con, SQLITE_TABLE, USERS_COLUMNS)
+            written = dump_rows(own_con, SQLITE_TABLE, USERS_COLUMNS, rows, replace=True)
+        finally:
+            own_con.close()
+    else:
+        written = dump_rows(con, SQLITE_TABLE, USERS_COLUMNS, rows)
 
+    logger.info("User data dump complete: %d users written.", written)
     return written
 
 

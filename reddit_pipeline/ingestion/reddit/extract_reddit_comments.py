@@ -1,11 +1,12 @@
-"""Fetch the top comments of the run's most-discussed posts into Databricks.
+"""Fetch the top comments of the run's most-discussed posts and dump them into the run's SQLite database.
 
 Importing this module only loads environment variables; all Reddit API and
-Databricks work happens inside :func:`extract_comments`, so the module stays
+SQLite work happens inside :func:`extract_comments`, so the module stays
 importable and runnable (`python -m ingestion.reddit.extract_reddit_comments`).
 """
 
 import datetime
+import sqlite3
 from typing import Any
 
 from ingestion.reddit._common import (
@@ -15,22 +16,20 @@ from ingestion.reddit._common import (
     INCREMENTAL_WINDOW_HOURS,
     Submission,
     configure_logging,
-    connect,
-    ensure_columns,
-    ensure_table,
-    full_table,
+    connect_sqlite,
+    dump_rows,
+    ensure_sqlite_table,
     harvest_submissions,
     load_timestamp,
     logger,
     reddit_client,
-    replace_by_key,
     row_values,
     subreddit_list,
     validate_env,
     window_cutoff,
 )
 
-TABLE = full_table("r_comments")
+SQLITE_TABLE = "r_comments"
 
 
 def _comment_rows(submission: Submission, stamped_at: datetime.datetime) -> list[dict[str, Any]]:
@@ -58,12 +57,15 @@ def _comment_rows(submission: Submission, stamped_at: datetime.datetime) -> list
     ]
 
 
-def extract_comments() -> int:
-    """Extract the top comments of the busiest posts in the window into Databricks.
+def extract_comments(con: sqlite3.Connection | None = None) -> int:
+    """Extract the top comments of the busiest posts in the window into SQLite.
 
     Returns the number of comment rows written: those fetched inside the rolling
-    window. Rows outside the window are ignored, and rows the table already holds
-    for a fetched id are replaced.
+    window. Rows outside the window are ignored.
+
+    `con` is the caller's already-open SQLite connection, with the table already
+    created. Omitted, this opens and closes its own, which is what a hand run
+    does.
     """
     validate_env()
 
@@ -108,18 +110,17 @@ def extract_comments() -> int:
 
     rows = [row_values(COMMENTS_COLUMNS, comment) for comment in comments]
 
-    logger.info("Connecting to Databricks...")
-    connection, cursor = connect()
-    try:
-        ensure_table(cursor, TABLE, COMMENTS_COLUMNS)
-        ensure_columns(cursor, TABLE, COMMENTS_COLUMNS)
-        logger.info("Ingesting data into %s...", TABLE)
-        written = replace_by_key(cursor, TABLE, COMMENTS_COLUMNS, rows, "id")
-        logger.info("Comment data ingestion complete: %d comments written.", written)
-    finally:
-        cursor.close()
-        connection.close()
+    if con is None:
+        own_con = connect_sqlite()
+        try:
+            ensure_sqlite_table(own_con, SQLITE_TABLE, COMMENTS_COLUMNS)
+            written = dump_rows(own_con, SQLITE_TABLE, COMMENTS_COLUMNS, rows, replace=True)
+        finally:
+            own_con.close()
+    else:
+        written = dump_rows(con, SQLITE_TABLE, COMMENTS_COLUMNS, rows)
 
+    logger.info("Comment data dump complete: %d comments written.", written)
     return written
 
 

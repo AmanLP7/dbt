@@ -17,12 +17,16 @@ from __future__ import annotations
 
 import csv
 import datetime
+import json
 import logging
 import os
 import pathlib
+import sqlite3
 import time
 from collections import OrderedDict
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 import praw
@@ -113,6 +117,12 @@ REQUIRED_ENV = (
     "DATABRICKS_HTTP_PATH",
 )
 
+# Where the extractors dump a run's rows and `copy_into` reads them back: one
+# SQLite file per run, under `reddit_pipeline/data/` by default. Overridable so
+# an operator can point a one-off at a scratch path.
+REDDIT_SQLITE_PATH_ENV = "REDDIT_SQLITE_PATH"
+DEFAULT_SQLITE_PATH = pathlib.Path(__file__).resolve().parents[2] / "data" / "reddit.db"
+
 # Column name -> SQL type, in table order. `ingested_at` is last in every table:
 # the UTC timestamp the row was loaded, not a value Reddit supplied.
 POSTS_COLUMNS: OrderedDict[str, str] = OrderedDict(
@@ -156,6 +166,14 @@ USERS_COLUMNS: OrderedDict[str, str] = OrderedDict(
         ("ingested_at", "TIMESTAMP"),
     ]
 )
+
+# The three raw tables the extractors dump and `copy_into` lands, in the order a
+# `COPY INTO` run writes them.
+RAW_TABLE_COLUMNS: dict[str, OrderedDict[str, str]] = {
+    "r_posts": POSTS_COLUMNS,
+    "r_comments": COMMENTS_COLUMNS,
+    "r_users": USERS_COLUMNS,
+}
 
 logger = logging.getLogger(__name__)
 
@@ -324,110 +342,321 @@ def ensure_columns(cursor: SqlExecutor, table: str, columns: OrderedDict[str, st
             cursor.execute(f"ALTER TABLE {table} ADD COLUMNS ({name} {type_name});")
 
 
-# `executemany` sends one statement per row: measured against this warehouse it
-# cost 2.00 s per comment row and 1.68 s per user row, so a 200-user load spent
-# five and a half minutes on round trips. Rows are instead batched into
-# multi-row INSERTs, and both bounds below apply. The row cap keeps the
-# statement readable and the parameter count low; the byte cap is the server's
-# own limit, which a single large body can exhaust on its own — DBSQL rejects a
-# statement whose bound parameters total more than _PARAMETER_BYTES. A row
-# bigger than the whole budget still goes alone; truncating it would break the
-# raw table's fidelity contract.
-INSERT_CHUNK_ROWS = 50
-_PARAMETER_BYTES = 1_048_576
-INSERT_CHUNK_CHARS = _PARAMETER_BYTES * 3 // 4
-
-# A key delete carries one parameter per id, so it is bounded by the same
-# parameter limit but nothing else: 5,000 short ids stay far inside it, and a run
-# reading every subreddit in the seed needs a handful of statements rather than
-# one per row.
-DELETE_CHUNK_ROWS = 5_000
+# --- SQLite dump path ---------------------------------------------------------
+# The extractors no longer write to Databricks directly. A run fetches from
+# Reddit and dumps every fetched row into one local SQLite database, and the
+# `copy_into` module exports that dump to NDJSON and lands it with `COPY INTO`.
+# The dbt staging models dedupe by id, so the raw tables are append-only.
 
 
-def _row_bytes(row: Sequence[Any]) -> int:
-    """Approximate the parameter cost of one row, in UTF-8 bytes.
+def sqlite_path() -> Path:
+    """The SQLite database the extractors write and `copy_into` reads.
 
-    The server's limit is bytes, not characters, and a comment body is user text:
-    a single emoji is four bytes. Counting `len()` instead understates a
-    non-ASCII row by up to 4×, and the batch that follows then trips the limit.
-    Non-strings are ids, scores and timestamps — a constant few bytes each.
+    `REDDIT_SQLITE_PATH`, else `reddit_pipeline/data/reddit.db`.
     """
-    return sum(len(value.encode()) if isinstance(value, str) else 8 for value in row)
+    return Path(os.environ.get(REDDIT_SQLITE_PATH_ENV, DEFAULT_SQLITE_PATH)).expanduser()
 
 
-def chunk_rows(rows: Sequence[Sequence[Any]]) -> list[list[Sequence[Any]]]:
-    """Split rows into chunks that respect both the row and the parameter budget."""
-    chunks: list[list[Sequence[Any]]] = []
-    current: list[Sequence[Any]] = []
-    size = 0
-    for row in rows:
-        cost = _row_bytes(row)
-        if current and (len(current) >= INSERT_CHUNK_ROWS or size + cost > INSERT_CHUNK_CHARS):
-            chunks.append(current)
-            current, size = [], 0
-        current.append(row)
-        size += cost
-    if current:
-        chunks.append(current)
-    return chunks
+def connect_sqlite(path: Path | None = None, *, reset: bool = False) -> sqlite3.Connection:
+    """Open the run's SQLite database, creating the file and parent directory.
+
+    `reset=True` starts a fresh file, so an extractor run replaces rather than
+    appends to the previous run's rows.
+    """
+    resolved = path or sqlite_path()
+    if reset:
+        resolved.unlink(missing_ok=True)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(resolved)
 
 
-def _insert_sql(table: str, columns: OrderedDict[str, str], row_count: int) -> str:
-    """Build one INSERT carrying `row_count` value tuples for a column mapping."""
-    names = ", ".join(columns)
-    placeholders = ", ".join([f"({', '.join('?' for _ in columns)})"] * row_count)
-    return f"INSERT INTO {table} ({names}) VALUES {placeholders}"
+def ensure_sqlite_table(con: sqlite3.Connection, table: str, columns: OrderedDict[str, str]) -> None:
+    """Create the SQLite table if it does not exist, mapping Databricks types to SQLite."""
+    sqlite_types = {"STRING": "TEXT", "INT": "INTEGER", "DOUBLE": "REAL", "BOOLEAN": "INTEGER", "TIMESTAMP": "TEXT"}
+    column_defs = ", ".join(f"{name} {sqlite_types[type_name]}" for name, type_name in columns.items())
+    con.execute(f"CREATE TABLE IF NOT EXISTS {table} ({column_defs})")
+    con.commit()
 
 
-def _insert_rows(
-    cursor: SqlExecutor,
+def dump_rows(
+    con: sqlite3.Connection,
     table: str,
     columns: OrderedDict[str, str],
     rows: Sequence[Sequence[Any]],
-) -> None:
-    """Insert `rows` in as few statements as the row and parameter budgets allow."""
-    for chunk in chunk_rows(rows):
-        params = tuple(value for row in chunk for value in row)
-        cursor.execute(_insert_sql(table, columns, len(chunk)), params)
+    *,
+    replace: bool = False,
+) -> int:
+    """Write `rows` into the SQLite table in one `executemany`, converting values first.
+
+    The dump stores the values the way SQLite keeps them: a `TIMESTAMP` that is
+    still a `datetime` is rendered as an ISO-8601 UTC string, and a `BOOLEAN` is
+    collapsed to `0`/`1`. Everything else passes through as-is. `replace=True`
+    clears the table first, which is how a fresh run overwrites the previous one.
+    """
+    if replace:
+        con.execute(f"DELETE FROM {table}")
+    names = ", ".join(columns)
+    placeholders = ", ".join("?" for _ in columns)
+    converted: list[tuple[Any, ...]] = []
+    for row in rows:
+        values: list[Any] = []
+        for value, type_name in zip(row, columns.values(), strict=True):
+            if type_name == "TIMESTAMP" and isinstance(value, datetime.datetime):
+                values.append(value.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+            elif type_name == "BOOLEAN":
+                values.append(int(bool(value)))
+            else:
+                values.append(value)
+        converted.append(tuple(values))
+    con.executemany(f"INSERT INTO {table} ({names}) VALUES ({placeholders})", converted)
+    con.commit()
+    return len(rows)
 
 
-def replace_by_key(
-    cursor: SqlExecutor,
+# --- COPY INTO machinery ------------------------------------------------------
+# The other half of the write path: export the SQLite dump to newline-delimited
+# JSON, upload the files to a Unity Catalog volume, and land each table with one
+# `COPY INTO`. Nothing crosses the SQL parameter channel; the warehouse reads its
+# own object storage.
+REDDIT_VOLUME_ENV = "REDDIT_VOLUME"
+STAGING_VOLUME = "staging"
+STAGING_PREFIX = "load_"
+
+# Files per `COPY INTO` should be large, because each one is a separate list,
+# parse and commit task. 200 MB keeps a run in a handful of files, which a
+# small warehouse can read in parallel without making any one task the
+# bottleneck. Below ~16 MB the per-file overhead starts to dominate.
+NDJSON_FILE_BYTES = 200 * 1000 * 1000
+
+
+def volume_fqn() -> str:
+    """Fully-qualified staging volume, derived from the raw schema."""
+    if configured := os.environ.get(REDDIT_VOLUME_ENV):
+        return configured
+    return f"{CATALOG}.{SCHEMA}.{STAGING_VOLUME}"
+
+
+def volume_root(fqn: str | None = None) -> str:
+    """`/Volumes/catalog/schema/volume` — the path a `COPY INTO` reads."""
+    catalog, schema, volume = (fqn or volume_fqn()).split(".")
+    return f"/Volumes/{catalog}/{schema}/{volume}"
+
+
+def ensure_volume(cursor: SqlExecutor, fqn: str | None = None) -> str:
+    """Create the staging volume if it does not exist. Returns its fully-qualified name."""
+    resolved = fqn or volume_fqn()
+    cursor.execute(f"CREATE VOLUME IF NOT EXISTS {resolved};")
+    logger.info("Ensured staging volume %s", resolved)
+    return resolved
+
+
+def copy_selection(columns: OrderedDict[str, str]) -> str:
+    """The projection `COPY INTO` reads, with each non-string column cast to its target type.
+
+    JSON inference types every integer literal as `BIGINT`, and `COPY INTO` refuses
+    to merge `BIGINT` into an `INT` column. A `SELECT` around the file read is the
+    documented way to control it, and casting here is deterministic where
+    inference is not.
+    """
+    return ", ".join(
+        f"`{name}`" if kind == "STRING" else f"CAST(`{name}` AS {kind}) AS `{name}`" for name, kind in columns.items()
+    )
+
+
+def copy_into_statement(table: str, source: str, columns: OrderedDict[str, str]) -> str:
+    """One `COPY INTO` for a whole directory of NDJSON files.
+
+    `force = 'false'` is the default and is written out on purpose: it is what
+    makes a retried run a no-op instead of a duplicate. `COPY INTO` keeps a load
+    history keyed by file path, so files already committed are skipped without
+    being read.
+    """
+    return (
+        f"COPY INTO {table}\n"
+        f"FROM (SELECT {copy_selection(columns)} FROM '{source}')\n"
+        "FILEFORMAT = JSON\n"
+        "COPY_OPTIONS ('force' = 'false')"
+    )
+
+
+def json_value(value: Any, sql_type: str) -> Any:
+    """Coerce one value to the JSON literal `COPY INTO` will read back as `sql_type`.
+
+    `TIMESTAMP` values were already rendered to ISO strings by `dump_rows`, so they
+    pass through as text; `BOOLEAN` was stored as `0`/`1`, so it is turned back
+    into a JSON boolean; `INT` and `DOUBLE` become JSON numbers.
+    """
+    if value is None:
+        return None
+    if sql_type == "BOOLEAN":
+        return bool(value)
+    if sql_type == "INT":
+        return int(value)
+    if sql_type == "DOUBLE":
+        return float(value)
+    return value  # STRING and TIMESTAMP are already strings
+
+
+def ndjson_line(columns: OrderedDict[str, str], row: Sequence[Any]) -> bytes:
+    """One row as NDJSON, UTF-8 encoded.
+
+    Keys are the column names, which is how `COPY INTO ... FILEFORMAT = JSON`
+    matches fields to columns — by name, not position. `ensure_ascii` stays off so
+    non-ASCII payloads are written as UTF-8 rather than `\\uXXXX` escapes.
+    """
+    record = {name: json_value(value, kind) for (name, kind), value in zip(columns.items(), row, strict=True)}
+    return (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+
+
+@dataclass(frozen=True)
+class ExportedFile:
+    """One NDJSON file written to the local work directory."""
+
+    path: Path
+    rows: int
+    size: int
+
+
+def export_ndjson(
+    con: sqlite3.Connection,
     table: str,
     columns: OrderedDict[str, str],
-    rows: Sequence[tuple[Any, ...]],
-    key: str,
-) -> int:
-    """Upsert `rows` by `key`: delete the fetched keys, then insert the rows.
+    out_dir: Path,
+    *,
+    file_bytes: int = NDJSON_FILE_BYTES,
+) -> Iterator[ExportedFile]:
+    """Write every row of `table` to NDJSON files of about `file_bytes` each.
 
-    Every raw load is an upsert on the entity's own id, never a window rewrite.
-    A `delete where created_utc >= cutoff` scope cannot be exact once a run reads
-    several subreddits through bounded listings: two consecutive runs cover
-    different spans of the same day, so the second deletes rows the first wrote
-    and never refetches them. Deleting exactly the ids fetched this run is
-    lossless whatever the run's coverage, and it keeps one row per entity instead
-    of one per run. `stg_reddit_*` still dedupes, as the at-least-once case —
-    rows committed whose acknowledgement was lost — can still land twice.
-
-    Each statement autocommits and there is no transaction spanning the two, so
-    the delete and the insert are *interleaved* by chunk rather than run as two
-    passes: delete a chunk, write that chunk, next chunk. Deleting everything
-    first would let a single failed INSERT leave the whole run's ids gone, and a
-    daily run only reads the last 26 hours, so rows older than that at delete
-    time would never come back. Interleaved, a failure can strand at most one
-    chunk — and that chunk re-fetches on the next run.
-
-    Does nothing when there is nothing to insert: a delete with no insert would
-    drop rows that no fetch can restore. Returns the number of rows written.
+    The dump is a fresh per-run artifact, so there is no watermark or paging: the
+    whole table is one `SELECT *`. A file is closed when the next row would push
+    it past the target, so files are never larger than one row over the target and
+    a single oversized row still gets its own file.
     """
-    if not rows:
-        logger.info("No rows to load into %s; skipping delete and insert.", table)
-        return 0
-    key_index = list(columns).index(key)
-    for start in range(0, len(rows), DELETE_CHUNK_ROWS):
-        group = rows[start : start + DELETE_CHUNK_ROWS]
-        keys = tuple(row[key_index] for row in group)
-        placeholders = ", ".join("?" for _ in keys)
-        cursor.execute(f"DELETE FROM {table} WHERE {key} IN ({placeholders});", keys)
-        _insert_rows(cursor, table, columns, group)
-    return len(rows)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    handle = None
+    path: Path | None = None
+    index = 0
+    rows = 0
+    size = 0
+    try:
+        for row in con.execute(f"SELECT * FROM {table}"):
+            if handle is None or path is None:
+                path = out_dir / f"part-{index:05d}.json"
+                handle = path.open("wb")
+            line = ndjson_line(columns, row)
+            handle.write(line)
+            size += len(line)
+            rows += 1
+            if size >= file_bytes:
+                handle.close()
+                handle = None
+                yield ExportedFile(path, rows, size)
+                index += 1
+                rows = size = 0
+        if handle is not None and path is not None:
+            handle.close()
+            handle = None
+            yield ExportedFile(path, rows, size)
+    finally:
+        if handle is not None:
+            handle.close()
+
+
+class VolumeFiles:
+    """The file half of a volume: upload and delete.
+
+    `COPY INTO` needs rows in a volume, and a volume is object storage, so there
+    is no SQL statement that writes one. This wraps the Files API — the same thing
+    `databricks fs cp` calls — behind the two operations the loader needs, so the
+    tests can stand in a recording double.
+    """
+
+    def __init__(self, client: Any = None) -> None:
+        if client is None:
+            from databricks.sdk import WorkspaceClient
+
+            client = WorkspaceClient(profile=os.environ.get("DATABRICKS_CONFIG_PROFILE", "DEFAULT"))
+        self._client = client
+
+    def upload(self, remote_path: str, local_path: Path) -> None:
+        """Upload one local file, overwriting any file already at that path."""
+        with local_path.open("rb") as handle:
+            self._client.files.upload(remote_path, handle, overwrite=True)
+
+    def list_dirs(self, remote_dir: str, *, prefix: str = "") -> list[str]:
+        """Child directories of `remote_dir` whose name starts with `prefix`, sorted.
+
+        The API returns directory paths **with a trailing slash**, so the basename
+        has to strip it first: `rstrip("/").rsplit("/", 1)[-1]`. Taking the last
+        segment of the raw path yields an empty string for every directory, which
+        makes `prefix` match nothing — measured, and it silently turned
+        `clear_staging` into a no-op until a leftover directory was found by hand.
+        """
+        try:
+            entries = self._client.files.list_directory_contents(remote_dir)
+            paths = [
+                entry.path
+                for entry in entries
+                if entry.is_directory and entry.path.rstrip("/").rsplit("/", 1)[-1].startswith(prefix)
+            ]
+        except Exception as exc:  # a volume with nothing in it, or not there at all
+            logger.debug("Nothing to list at %s (%s)", remote_dir, exc)
+            return []
+        return sorted(paths)
+
+    def remove_dir(self, remote_dir: str) -> int:
+        """Delete a directory and everything under it; returns the count of files removed.
+
+        Three API facts, all measured, shape this:
+
+        - `files.delete` on a directory raises `NotFound` — it only deletes files.
+        - `delete_directory` is **not recursive**: on a non-empty directory it raises
+          `BadRequest: The directory is not empty`.
+        - So the files have to go first, outer directory last, deepest first.
+
+        A directory that could not be emptied is a warning, not an exception: it is
+        stale staging, and failing the load over it would be the wrong trade.
+        """
+        removed, leftover = self._delete_tree(remote_dir)
+        if leftover:
+            logger.warning(
+                "Leaving %d entr%s under %s: the load does not depend on them, "
+                "but they will be retried on the next run.",
+                leftover,
+                "y" if leftover == 1 else "ies",
+                remote_dir,
+            )
+        return removed
+
+    def _delete_tree(self, remote_dir: str) -> tuple[int, int]:
+        """Delete files and subdirectories below `remote_dir`, then the directory itself.
+
+        Returns `(files removed, entries that refused to go)`.
+        """
+        removed = 0
+        leftover = 0
+        try:
+            entries = list(self._client.files.list_directory_contents(remote_dir))
+        except Exception as exc:  # nothing there at all — the normal case on a first run
+            logger.debug("Nothing to remove at %s (%s)", remote_dir, exc)
+            return 0, 0
+
+        for entry in entries:
+            if entry.is_directory:
+                nested_removed, nested_left = self._delete_tree(entry.path)
+                removed += nested_removed
+                leftover += nested_left
+            else:
+                try:
+                    self._client.files.delete(entry.path)
+                    removed += 1
+                except Exception as exc:
+                    logger.debug("Could not delete %s (%s)", entry.path, exc)
+                    leftover += 1
+
+        try:
+            self._client.files.delete_directory(remote_dir)
+        except Exception as exc:
+            logger.debug("Could not remove directory %s (%s)", remote_dir, exc)
+            leftover += 1
+        return removed, leftover

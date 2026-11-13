@@ -2,12 +2,16 @@
 
 Four tasks, in dependency order:
 
-1. ``raw_reddit_posts`` (Python) — fetch the new and top-of-day posts of every
-   subreddit in ``seeds/sections.csv`` into ``workspace.topic_raw.r_posts``.
-2. ``raw_reddit_comments`` (Python) — fetch the top comments of the most-commented
-   in-window posts into ``workspace.topic_raw.r_comments``.
-3. ``raw_reddit_users`` (Python) — fetch post/comment authors into
-   ``workspace.topic_raw.r_users``.
+1. ``reddit_raw/r_posts/<subreddit>`` (Python, one asset per row of
+   ``seeds/sections.csv``) — fetch that subreddit's new and top-of-day posts into a
+   per-run SQLite dump, so each load is separately visible, retryable and failable
+   in the UI. ``reddit_raw/r_posts`` is the barrier those loads feed: it lands the
+   dumped posts into ``workspace.topic_raw.r_posts`` via COPY INTO.
+2. ``reddit_raw/r_comments`` (Python + Databricks) — fetch the top comments of the
+   most-commented in-window posts into the SQLite dump, then COPY INTO
+   ``workspace.topic_raw.r_comments``.
+3. ``reddit_raw/r_users`` (Python + Databricks) — fetch post/comment authors into
+   the SQLite dump, then COPY INTO ``workspace.topic_raw.r_users``.
 4. ``dbt_reddit`` (dbt) — one ``dbt build``: staging, intermediate, marts and their
    tests.
 
@@ -16,10 +20,9 @@ The job runs on demand and, once someone starts it in the UI, on
 incremental on ``edition_date``, so each day's paper is written once and every older
 edition stays readable after the raw tables roll.
 
-Each extractor asset carries the asset key Dagster derives for its dbt source
-(``<source_name>/<table_name>``), so the Python asset and the dbt source spec merge:
-the extractors become the upstreams of the staging models and a run materializes
-the loads first.
+The extractors dump to SQLite without upserting, and the three raw assets land those
+dumps append-only via ``COPY INTO``: the dbt staging models dedupe by id, so the
+three dbt ``source`` nodes map to the extractor asset keys directly.
 """
 
 # No `from __future__ import annotations` here, unlike the rest of the project:
@@ -42,6 +45,7 @@ from dagster_dbt import (
     DbtProject,
     dbt_assets,
 )
+from pydantic import PrivateAttr
 
 # The repo root *is* the dbt project, so the orchestration package sits beside the
 # models it schedules: <repo>/orchestration/src/reddit_pipeline_orchestration/definitions.py
@@ -53,8 +57,17 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from ingestion.reddit._common import databricks_token  # noqa: E402
-from ingestion.reddit.extract_reddit import extract_posts  # noqa: E402
+from ingestion.reddit._common import (  # noqa: E402
+    COMMENTS_COLUMNS,
+    POSTS_COLUMNS,
+    USERS_COLUMNS,
+    connect_sqlite,
+    databricks_token,
+    ensure_sqlite_table,
+    subreddit_list,
+)
+from ingestion.reddit.copy_into import copy_into_raw  # noqa: E402
+from ingestion.reddit.extract_reddit import extract_posts_for  # noqa: E402
 from ingestion.reddit.extract_reddit_comments import extract_comments  # noqa: E402
 from ingestion.reddit.extract_reddit_users import extract_users  # noqa: E402
 
@@ -115,6 +128,24 @@ RAW_POSTS_KEY = dg.AssetKey(["reddit_raw", "r_posts"])
 RAW_COMMENTS_KEY = dg.AssetKey(["reddit_raw", "r_comments"])
 RAW_USERS_KEY = dg.AssetKey(["reddit_raw", "r_users"])
 
+# The seed is the single source of the subreddit list, so one asset per seeded
+# subreddit is generated from it here rather than repeated in Python: adding a
+# subreddit stays one CSV row, and the graph, the extractor and the marts cannot
+# disagree about which subreddits exist.
+#
+# One asset each, not one asset partitioned by subreddit, because a partitioned
+# asset cannot be materialised by an unpartitioned job: `reddit_refresh` would have
+# to become a partitioned job, and every other asset in it -- the comment and user
+# loads and the whole `dbt build` -- would then run once per partition. Separate
+# assets keep one run covering everything in order, while the UI still lists each
+# subreddit load as its own element with its own status, retry and failure.
+SUBREDDIT_NAMES = subreddit_list()
+
+
+def posts_key(name: str) -> dg.AssetKey:
+    """The asset key of one subreddit's posts, under the key the dbt source merges into."""
+    return dg.AssetKey([*RAW_POSTS_KEY.path, name])
+
 
 # dbt's tests become Dagster asset checks: every test declared on a model or a seed
 # attaches to that node automatically. Source tests, if any are added to src_reddit.yml,
@@ -128,8 +159,8 @@ class RedditDbtTranslator(DagsterDbtTranslator):
     def get_group_name(self, dbt_resource_props: Mapping[str, Any]) -> str | None:
         """Group every dbt-built asset as `transformation`.
 
-        Sources return None, meaning Dagster's default group: each
-        `reddit_raw.r_*` source shares its asset key with an extractor, and a
+        Sources return None, meaning Dagster's default group: each `reddit_raw.r_*`
+        source shares its asset key with the extractor asset that lands it, and a
         second, conflicting group on that key would be a definition error.
         """
         if dbt_resource_props["resource_type"] == "source":
@@ -155,22 +186,85 @@ RETRY_POLICY = dg.RetryPolicy(
 )
 
 
+class RedditSqlite(dg.ConfigurableResource):
+    """One SQLite dump shared by every load in a run.
+
+    The per-subreddit assets are separate nodes so each can fail and retry alone,
+    and they all write into the same per-run SQLite file: the connection is opened
+    once here, with `reset=True` so a stale dump from a previous run never leaks
+    into this one, the three tables are created once, and the connection is closed
+    when the run ends.
+
+    A multiprocess executor gives each worker process its own resource instance, so
+    this stays one connection per process rather than one shared across processes.
+    The default executor is in-process, so every load shares this one connection.
+    """
+
+    _connection: Any = PrivateAttr(default=None)
+
+    def setup_for_execution(self, context: dg.InitResourceContext) -> None:
+        self._connection = connect_sqlite(reset=True)
+        ensure_sqlite_table(self._connection, "r_posts", POSTS_COLUMNS)
+        ensure_sqlite_table(self._connection, "r_comments", COMMENTS_COLUMNS)
+        ensure_sqlite_table(self._connection, "r_users", USERS_COLUMNS)
+
+    def teardown_after_execution(self, context: dg.InitResourceContext) -> None:
+        if self._connection is not None:
+            self._connection.close()
+
+    @property
+    def connection(self) -> Any:
+        """The run's open SQLite connection, valid only between setup and teardown."""
+        if self._connection is None:
+            raise RuntimeError("The Reddit SQLite resource was used outside a run")
+        return self._connection
+
+
+def posts_asset(name: str) -> dg.AssetsDefinition:
+    """The posts load for one seeded subreddit, as its own asset node.
+
+    Built per subreddit rather than declared 66 times: the body is identical and
+    only `name` differs, so a loop over the seed keeps the list in one place.
+    """
+
+    @dg.asset(
+        key=posts_key(name),
+        group_name="ingestion",
+        kinds={"python"},
+        retry_policy=RETRY_POLICY,
+        description=(
+            f"r/{name}: its new and top-of-day listings, filtered to the 26-hour read "
+            "window and dumped into the run's SQLite file for COPY INTO."
+        ),
+    )
+    def load(context: dg.AssetExecutionContext, sqlite: RedditSqlite) -> dg.MaterializeResult:
+        rows_written = extract_posts_for(name, sqlite.connection)
+        context.log.info("r/%s: wrote %s posts", name, rows_written)
+        return dg.MaterializeResult(metadata={"subreddit": name, "rows_written": rows_written})
+
+    return load
+
+
+POSTS_ASSETS = [posts_asset(name) for name in SUBREDDIT_NAMES]
+
+
 @dg.asset(
     key=RAW_POSTS_KEY,
+    deps=[posts_key(name) for name in SUBREDDIT_NAMES],
     group_name="ingestion",
     kinds={"python", "databricks"},
     retry_policy=RETRY_POLICY,
     description=(
-        "The new and top-of-day listings of every seeded subreddit, filtered to the "
-        "26-hour read window and upserted by post id into workspace.topic_raw.r_posts. "
-        "Comments and users load from the same posts, so this runs first."
+        "Every seeded subreddit's posts are in the run's SQLite dump. This node "
+        "lands the dumped posts into workspace.topic_raw.r_posts via COPY INTO, so "
+        "it materializes only after every per-subreddit load succeeded."
     ),
 )
 def raw_reddit_posts(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
-    """Task 1: fetch every seeded subreddit's listings and upsert the posts."""
-    rows_written = extract_posts()
-    context.log.info("Wrote %s posts", rows_written)
-    return dg.MaterializeResult(metadata={"rows_written": rows_written})
+    """Task 1: land the dumped posts into workspace.topic_raw.r_posts via COPY INTO."""
+    result = copy_into_raw(tables=("r_posts",))
+    context.log.info("Landed %s posts via COPY INTO", result.rows.get("r_posts", 0))
+    return dg.MaterializeResult(metadata={"rows_landed": result.rows})
 
 
 @dg.asset(
@@ -180,15 +274,15 @@ def raw_reddit_posts(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
     kinds={"python", "databricks"},
     retry_policy=RETRY_POLICY,
     description=(
-        "Top comments of the 200 most-commented in-window posts, upserted by comment id "
-        "into workspace.topic_raw.r_comments."
+        "Top comments of the 200 most-commented in-window posts, dumped into the "
+        "run's SQLite file and landed into workspace.topic_raw.r_comments via COPY INTO."
     ),
 )
-def raw_reddit_comments(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
-    """Task 2: fetch the most-commented posts' comments and upsert them."""
-    rows_written = extract_comments()
-    context.log.info("Wrote %s comments", rows_written)
-    return dg.MaterializeResult(metadata={"rows_written": rows_written})
+def raw_reddit_comments(context: dg.AssetExecutionContext, sqlite: RedditSqlite) -> dg.MaterializeResult:
+    """Task 2: fetch the most-commented posts' comments, dump them to SQLite, and COPY INTO."""
+    rows_written = extract_comments(sqlite.connection)
+    result = copy_into_raw(tables=("r_comments",))
+    return dg.MaterializeResult(metadata={"rows_written": rows_written, "rows_landed": result.rows})
 
 
 @dg.asset(
@@ -198,15 +292,16 @@ def raw_reddit_comments(context: dg.AssetExecutionContext) -> dg.MaterializeResu
     kinds={"python", "databricks"},
     retry_policy=RETRY_POLICY,
     description=(
-        "Post and comment authors as key-based upserts in workspace.topic_raw.r_users, "
-        "so returning users receive refreshed karma and new users are appended."
+        "Post and comment authors dumped into the run's SQLite file and landed "
+        "into workspace.topic_raw.r_users via COPY INTO; the staging models dedupe "
+        "by id, so returning users are refreshed and new users are appended."
     ),
 )
-def raw_reddit_users(context: dg.AssetExecutionContext) -> dg.MaterializeResult:
-    """Task 3: collect the post and comment authors across the seed and upsert them."""
-    rows_written = extract_users()
-    context.log.info("Wrote %s users", rows_written)
-    return dg.MaterializeResult(metadata={"rows_written": rows_written})
+def raw_reddit_users(context: dg.AssetExecutionContext, sqlite: RedditSqlite) -> dg.MaterializeResult:
+    """Task 3: collect the post and comment authors, dump them to SQLite, and COPY INTO."""
+    rows_written = extract_users(sqlite.connection)
+    result = copy_into_raw(tables=("r_users",))
+    return dg.MaterializeResult(metadata={"rows_written": rows_written, "rows_landed": result.rows})
 
 
 @dbt_assets(
@@ -244,8 +339,14 @@ daily_edition_refresh = dg.ScheduleDefinition(
 )
 
 defs = dg.Definitions(
-    assets=[raw_reddit_posts, raw_reddit_comments, raw_reddit_users, dbt_reddit],
-    resources={"dbt": DbtCliResource(project_dir=DBT_PROJECT)},
+    assets=[
+        *POSTS_ASSETS,
+        raw_reddit_posts,
+        raw_reddit_comments,
+        raw_reddit_users,
+        dbt_reddit,
+    ],
+    resources={"dbt": DbtCliResource(project_dir=DBT_PROJECT), "sqlite": RedditSqlite()},
     jobs=[reddit_refresh],
     schedules=[daily_edition_refresh],
 )

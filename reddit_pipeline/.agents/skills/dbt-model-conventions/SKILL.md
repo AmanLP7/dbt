@@ -42,9 +42,9 @@ is wrapped in `{% if is_incremental() %}`, so a first/full build loads all histo
 and each later run merges only comments created in the last 26 hours. That window
 mirrors the ingestion `INCREMENTAL_WINDOW_HOURS = 26`; the shared value comes from
 the `window_hours()` macro (see Macros), so the SQL and the extractors cannot drift
-apart silently. The window is a *read* filter on both sides — the extractors upsert
-by id and never delete by time, so re-reading 26 hours is a cheap dedupe rather than
-a re-download.
+apart silently. The window is a *read* filter on both sides — the extractors dump
+append-only and never delete by time, and the staging models dedupe by id, so
+re-reading 26 hours is a cheap dedupe rather than a re-download.
 
 ## Daily edition
 

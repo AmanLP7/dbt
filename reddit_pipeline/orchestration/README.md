@@ -48,34 +48,48 @@ than a copy.
 
 ## The four tasks
 
-One job, four assets, in this order because the later ones read what the earlier ones
-write:
+One job, in this order because the later ones read what the earlier ones write:
 
-1. **`reddit_raw/r_posts`** (Python, group `ingestion`, kinds
-   `python`/`databricks`) — calls `extract_posts()` and returns `rows_written`.
-2. **`reddit_raw/r_comments`** (Python) — calls `extract_comments()`; depends on the
-   posts load, which it derives from.
-3. **`reddit_raw/r_users`** (Python) — calls `extract_users()`; depends on the posts
-   load for the same reason.
+1. **`reddit_raw/r_posts/<subreddit>`** (Python, group `ingestion`, kinds `python`) —
+   one asset per row of `seeds/sections.csv` (66 today), generated in a loop over the
+   seed. Each calls `extract_posts_for(name, sqlite.connection)` and returns
+   `rows_written` plus the subreddit, so the UI lists every subreddit load as its own
+   element: it can be materialised alone, its retry and failure are scoped to that
+   subreddit, and a private or rate-limited subreddit no longer takes the other 65
+   down with it. The 66 loads share one SQLite connection (the `RedditSqlite`
+   resource, one fresh `data/reddit.db` per run); extractors no longer talk to the
+   warehouse, they dump into that database. **`reddit_raw/r_posts`** (Python +
+   Databricks) is the barrier all 66 feed: it materialises only once every
+   per-subreddit load has succeeded, then calls `copy_into_raw(tables=("r_posts",))`
+   to land the dumped posts into `workspace.topic_raw.r_posts`.
+2. **`reddit_raw/r_comments`** (Python + Databricks) — calls
+   `extract_comments(sqlite.connection)` then `copy_into_raw(tables=("r_comments",))`
+   to land the comments into `workspace.topic_raw.r_comments`; depends on the posts
+   load, which it derives from.
+3. **`reddit_raw/r_users`** (Python + Databricks) — calls
+   `extract_users(sqlite.connection)` then `copy_into_raw(tables=("r_users",))` to
+   land the users into `workspace.topic_raw.r_users`; depends on the posts load for
+   the same reason.
 4. **`dbt_reddit`** (dbt) — one `dbt build` (seeds → staging → intermediate → marts →
    tests) through `DbtCliResource`, yielding the fifteen dbt assets.
 
-Each extractor asset is declared under the asset key Dagster derives for its dbt
-source (`<source_name>/<table_name>`, e.g. `reddit_raw/r_posts`), so the two
-definitions merge and the extractor becomes the upstream of `stg_reddit_posts`. That
-merge is what makes one run extract and then build instead of doing either half
+Each raw asset is declared under the asset key Dagster derives for its dbt source
+(`<source_name>/<table_name>`, e.g. `reddit_raw/r_posts`), so the two definitions
+merge and the load that lands each table becomes the upstream of its staging model.
+That merge is what makes one run extract and then build instead of doing either half
 alone.
 
-All four assets — the three extractors and `dbt_reddit` — carry the ported Prefect
-retry policy: three retries on an exponential backoff with jitter.
+The per-subreddit loads, `reddit_raw/r_comments`, `reddit_raw/r_users` and
+`dbt_reddit` carry the ported Prefect retry policy: three retries on an exponential
+backoff with jitter.
 
 ## Assets, checks, job, schedules
 
 | Kind | Count | Names |
 | --- | --- | --- |
-| Assets | 18 | `reddit_raw/r_posts`, `reddit_raw/r_comments`, `reddit_raw/r_users`, `sections`, `trending_stopwords`, `stg_reddit_posts`, `stg_reddit_comments`, `stg_reddit_users`, `int_posts_enriched`, `int_comments_enriched`, `mart_post_summary`, `mart_user_metrics`, `mart_comment_history`, `mart_daily_edition`, `mart_daily_section_summary`, `mart_daily_trending_terms`, `mart_daily_reading_list`, `mart_subreddit_daily_volume` |
+| Assets | 84 | `reddit_raw/r_posts` (barrier), `reddit_raw/r_posts/<subreddit>` × 66, `reddit_raw/r_comments`, `reddit_raw/r_users`, `sections`, `trending_stopwords`, `stg_reddit_posts`, `stg_reddit_comments`, `stg_reddit_users`, `int_posts_enriched`, `int_comments_enriched`, `mart_post_summary`, `mart_user_metrics`, `mart_comment_history`, `mart_daily_edition`, `mart_daily_section_summary`, `mart_daily_trending_terms`, `mart_daily_reading_list`, `mart_subreddit_daily_volume` |
 | Asset checks | 70 | every dbt test declared on the fifteen models and two seeds |
-| Asset groups | 2 | `ingestion` (the extractors), `transformation` (the fifteen dbt assets) |
+| Asset groups | 2 | `ingestion` (the per-subreddit loads and the three raw assets), `transformation` (the fifteen dbt assets) |
 | Job | 1 | `reddit_refresh` = `AssetSelection.all()` |
 | Schedules | 1 | `daily_edition_refresh` (cron `0 5 * * *`, UTC), shipped **stopped** |
 
@@ -137,12 +151,15 @@ cd orchestration && dagster dev
 The orchestration layer is an alternative, not a replacement:
 
 ```bash
-# 1. Land the raw rows.
+# 1. Land the raw rows in the local SQLite run database.
 python -m ingestion.reddit.extract_reddit
 python -m ingestion.reddit.extract_reddit_comments
 python -m ingestion.reddit.extract_reddit_users
 
-# 2. Build and test the models against the committed profile.
+# 2. Export the dump and COPY INTO the three raw tables.
+python -m ingestion.reddit.copy_into
+
+# 3. Build and test the models against the committed profile.
 DBT_PROFILES_DIR=profiles dbt build
 ```
 

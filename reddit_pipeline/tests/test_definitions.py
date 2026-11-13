@@ -1,12 +1,14 @@
 """The Dagster job that ties the extractors to the dbt models.
 
-`definitions.py` is the only place the two halves of the pipeline meet: each Python
-asset carries the key Dagster derives for its `reddit_raw.r_*` dbt source, so the source
-specs merge into the extractors and the staging models depend on the loads. Nothing else
-in the repo pins that merge, the tests the translator turns into asset checks, or the
-job's selection, so a renamed key or a flipped translator default could cut the
-extractors out of a run while every other test still passed. These assertions are
-offline: they read the resolved graph, never a warehouse or the network.
+`definitions.py` is the only place the pipeline's halves meet: the Python extractors
+dump rows into a local SQLite file, and each of the three raw assets lands its own
+dump into the warehouse via COPY INTO, carrying the default asset key its dbt source
+merges into — so the staging models depend on the loads that actually land the raw
+rows, and a run materialises the loads first. Nothing else in the repo pins that
+merge, the tests the translator turns into asset checks, or the job's selection, so a
+renamed key or a flipped translator default could cut the extractors out of a run
+while every other test still passed. These assertions are offline: they read the
+resolved graph, never a warehouse or the network.
 """
 
 from __future__ import annotations
@@ -23,12 +25,16 @@ from reddit_pipeline_orchestration import definitions as d
 POSTS = d.RAW_POSTS_KEY
 COMMENTS = d.RAW_COMMENTS_KEY
 USERS = d.RAW_USERS_KEY
-# The `source/table` strings the Dagster UI shows, and the keys the dbt sources merge into.
+# The `source/table` strings the Dagster UI shows. The three dbt sources keep their
+# default asset keys, so the staging models wait on the raw asset that lands the rows.
 POSTS_KEY, COMMENTS_KEY, USERS_KEY = (key.to_user_string() for key in (POSTS, COMMENTS, USERS))
+# One node per seeded subreddit, generated from `seeds/sections.csv`: this is the set
+# whose per-subreddit status the UI shows.
+POSTS_NODE_KEYS = {d.posts_key(name).to_user_string() for name in d.SUBREDDIT_NAMES}
 SPECS: dict[str, dg.AssetSpec] = {spec.key.to_user_string(): spec for spec in d.defs.resolve_all_asset_specs()}
 GRAPH = d.defs.resolve_asset_graph()
 
-EXTRACTOR_KEYS = {POSTS_KEY, COMMENTS_KEY, USERS_KEY}
+EXTRACTOR_KEYS = {POSTS_KEY, COMMENTS_KEY, USERS_KEY} | POSTS_NODE_KEYS
 MODEL_KEYS = {
     "stg_reddit_posts",
     "stg_reddit_comments",
@@ -59,10 +65,17 @@ def dep_keys(spec: dg.AssetSpec) -> set[str]:
     return user_keys(dep.asset_key for dep in spec.deps)
 
 
-def test_the_pipeline_is_three_python_extractors_thirteen_dbt_models_and_two_seeds() -> None:
+def test_the_pipeline_is_extractors_thirteen_models_and_two_seeds() -> None:
     assert set(SPECS) == ASSET_KEYS
 
-    for key in EXTRACTOR_KEYS:
+    # The per-subreddit loads only fetch into the SQLite dump; the three raw assets
+    # also COPY INTO the warehouse, so only they carry the databricks kind.
+    for key in POSTS_NODE_KEYS:
+        assert SPECS[key].group_name == "ingestion", key
+        assert SPECS[key].kinds >= {"python"}, key
+        assert "databricks" not in SPECS[key].kinds, key
+
+    for key in (POSTS_KEY, COMMENTS_KEY, USERS_KEY):
         assert SPECS[key].group_name == "ingestion", key
         assert SPECS[key].kinds >= {"python", "databricks"}, key
 
@@ -72,11 +85,17 @@ def test_the_pipeline_is_three_python_extractors_thirteen_dbt_models_and_two_see
 
 
 def test_the_extractors_land_the_dbt_sources_and_the_marts_chain_off_staging() -> None:
-    assert dep_keys(SPECS[POSTS_KEY]) == set(), "the posts extractor is a source, not a consumer"
+    # The posts key is the barrier every per-subreddit load feeds: it COPY INTOs
+    # r_posts only after all of them have dumped their rows.
+    assert dep_keys(SPECS[POSTS_KEY]) == POSTS_NODE_KEYS
+    for key in POSTS_NODE_KEYS:
+        assert dep_keys(SPECS[key]) == set(), f"{key} is a load, not a consumer"
     # Comments and users derive from the same hot posts, so both follow the posts load.
     assert dep_keys(SPECS[COMMENTS_KEY]) == {POSTS_KEY}
     assert dep_keys(SPECS[USERS_KEY]) == {POSTS_KEY}
 
+    # The dbt sources keep their default keys, so each staging model waits on the raw
+    # asset that actually lands its table.
     assert dep_keys(SPECS["stg_reddit_posts"]) == {POSTS_KEY}
     assert dep_keys(SPECS["stg_reddit_comments"]) == {COMMENTS_KEY}
     assert dep_keys(SPECS["stg_reddit_users"]) == {USERS_KEY}
@@ -96,6 +115,17 @@ def test_the_extractors_land_the_dbt_sources_and_the_marts_chain_off_staging() -
     assert dep_keys(SPECS["mart_comment_history"]) == {"int_comments_enriched", "stg_reddit_posts"}
 
 
+def test_every_seeded_subreddit_is_its_own_posts_node() -> None:
+    """The per-subreddit view is generated from the seed, never from a second list.
+
+    The graph must carry one node per seeded subreddit, each under the posts key the
+    dbt source merges into, or the UI silently drops a subreddit's monitoring row.
+    """
+    assert set(SPECS) >= POSTS_NODE_KEYS
+    assert {key.rsplit("/", 1)[1] for key in POSTS_NODE_KEYS} == set(d.SUBREDDIT_NAMES)
+    assert all(key.startswith(f"{POSTS_KEY}/") for key in POSTS_NODE_KEYS)
+
+
 def test_every_extractor_is_an_ancestor_of_the_comment_history_mart() -> None:
     # The job's selection is everything, but even a one-asset run has to start by
     # landing all three raw tables: the mart reads posts, comments and users.
@@ -107,9 +137,10 @@ def test_every_extractor_is_an_ancestor_of_the_comment_history_mart() -> None:
 def test_every_declared_test_becomes_an_asset_check() -> None:
     assert len(GRAPH.asset_check_keys) == 70
 
-    # The source declarations carry no tests, so no check attaches to an extractor.
+    # The source declarations carry no tests, so no check attaches to the three raw
+    # assets the sources merge into.
     for key in (POSTS, COMMENTS, USERS):
-        assert GRAPH.get_check_keys_for_assets({key}) == set(), key
+        assert GRAPH.get_check_keys_for_assets({key}) == set()
 
 
 def test_the_job_selects_every_asset() -> None:
@@ -135,8 +166,9 @@ def test_the_only_schedule_is_the_daily_edition_and_it_ships_stopped() -> None:
 def test_the_python_and_dbt_steps_carry_a_retry_policy() -> None:
     # A transient Reddit, warehouse or dbt failure should not need a manual re-run; the
     # policy now lives on the assets instead of the Prefect task decorators. Dagster
-    # keeps it on the op definition, which is where the run looks for it.
-    for asset in (d.raw_reddit_posts, d.raw_reddit_comments, d.raw_reddit_users, d.dbt_reddit):
+    # keeps it on the op definition, which is where the run looks for it. The retry is
+    # per subreddit load, so one flaky subreddit re-fetches alone.
+    for asset in (*d.POSTS_ASSETS, d.raw_reddit_posts, d.raw_reddit_comments, d.raw_reddit_users, d.dbt_reddit):
         policy = asset.op.retry_policy
         assert policy is not None, asset.op.name
         assert policy.max_retries == 3, asset.op.name

@@ -2,6 +2,9 @@ target/
 dbt_packages/
 logs/
 
+# Local SQLite run database the extractors dump into (data/reddit.db by default).
+data/
+
 # Local secrets (Reddit API + Databricks PAT)
 .env
 
