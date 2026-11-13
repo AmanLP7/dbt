@@ -257,15 +257,20 @@ fails.
 Run the whole pipeline once, headless, from `orchestration/`:
 
 ```bash
-dagster asset materialize -m reddit_pipeline_orchestration.definitions --select '*'
+dagster job execute -m reddit_pipeline_orchestration.definitions --job reddit_refresh
 ```
+
+Run the *job*, not `asset materialize`: an ad-hoc asset selection uses the default
+multiprocess executor, which fans the per-subreddit loads across workers and races on
+the shared SQLite dump. `reddit_refresh` pins `in_process_executor`.
 
 ### Scheduling
 
 One schedule: `daily_edition_refresh`, cron `0 5 * * *` UTC, driving the
 `reddit_refresh` job. It ships **stopped**, matching `daily_job_board_refresh` in the
 sibling project, so a deployment does not write to the warehouse until someone flips
-it in the UI. Until then a run is started from the UI or `dagster asset materialize`.
+it in the UI. Until then a run is started from the UI (`reddit_refresh`, not
+"Materialize all") or `dagster job execute --job reddit_refresh`.
 
 The cadence is daily because the `daily/` marts are incremental on `edition_date`: a
 second build inside the same day replaces that day's page rather than appending to it,

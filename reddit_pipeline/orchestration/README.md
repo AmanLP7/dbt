@@ -117,11 +117,16 @@ Run from `orchestration/`:
 # UI plus scheduler/daemon; code location auto-detected from [tool.dagster] module_name.
 dagster dev
 
-# Headless: extract, then dbt build, once. No UI. `dagster dev` is the command that
-# reads [tool.dagster]; `asset materialize` takes a workspace target, so name the
-# module with -m (it works from any directory once the package is installed).
-dagster asset materialize -m reddit_pipeline_orchestration.definitions --select '*'
+# Headless: run the reddit_refresh job once, no UI. Go through the *job*, not
+# `asset materialize`: an ad-hoc asset selection builds a job with the default
+# multiprocess executor, which fans the per-subreddit loads across workers and
+# races on the shared SQLite file. `reddit_refresh` pins `in_process_executor`.
+dagster job execute -m reddit_pipeline_orchestration.definitions --job reddit_refresh
 ```
+
+In the UI, launch **`reddit_refresh`** from the Jobs list — not "Materialize all" on
+the asset graph, which runs the same ad-hoc multiprocess executor and would hit
+`attempt to write a readonly database` again.
 
 `asset materialize` prints Dagster's first-run telemetry banner to stdout. Silence it
 by creating a `$DAGSTER_HOME/dagster.yaml` containing `telemetry: {enabled: false}`.

@@ -478,7 +478,7 @@ Run from the project directory. `dbt build` writes to the warehouse; the write g
 | Parse (no warehouse) | `DBT_PROFILES_DIR=profiles dbt parse` | same |
 | Build + test | `DBT_PROFILES_DIR=profiles dbt build` | same |
 | Extract/load only | `python -m ingestion.jobs.fetch_job_postings` | `python -m ingestion.reddit.extract_reddit`, `…_comments`, `…_users`, then `python -m ingestion.reddit.copy_into` |
-| Orchestrated run | `dagster asset materialize -m job_postings_orchestration.definitions --select '*'` | `dagster asset materialize -m reddit_pipeline_orchestration.definitions --select '*'` |
+| Orchestrated run | `dagster asset materialize -m job_postings_orchestration.definitions --select '*'` | `dagster job execute -m reddit_pipeline_orchestration.definitions --job reddit_refresh` (NOT `asset materialize`: the ad-hoc job's multiprocess executor races on the shared SQLite dump) |
 | UI + scheduler | `dagster dev` (from `orchestration/`) | `dagster dev` (from `orchestration/`) |
 | Offline tests | `pytest` | `pytest` |
 | Lint / types | `ruff format --check . && ruff check . && sqlfluff lint && pyright` | same |
