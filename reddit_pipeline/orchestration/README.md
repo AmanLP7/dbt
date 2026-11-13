@@ -48,7 +48,12 @@ than a copy.
 
 ## The four tasks
 
-One job, in this order because the later ones read what the earlier ones write:
+One job, in this order because the later ones read what the earlier ones write.
+The job pins `in_process_executor`: the 66 per-subreddit loads share one SQLite
+file, which has a single writer, so they run sequentially in one process. The
+default multiprocess executor would fan them out across workers, and each worker
+would `reset=True` (unlink and recreate) the shared file under the others —
+failing with `attempt to write a readonly database`.
 
 1. **`reddit_raw/r_posts/<subreddit>`** (Python, group `ingestion`, kinds `python`) —
    one asset per row of `seeds/sections.csv` (66 today), generated in a loop over the

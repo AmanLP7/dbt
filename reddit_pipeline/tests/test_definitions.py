@@ -163,6 +163,18 @@ def test_the_only_schedule_is_the_daily_edition_and_it_ships_stopped() -> None:
     assert schedule.job_name == "reddit_refresh"
 
 
+def test_the_refresh_job_pins_the_in_process_executor() -> None:
+    """The raw loads share one SQLite file, and SQLite has a single writer.
+
+    The 66 per-subreddit assets have no dependencies between them, so the default
+    multiprocess executor would fan them out across worker processes, each opening
+    its own `RedditSqlite` with `reset=True` and unlinking the file under the
+    others. The job must pin the in-process executor so every write happens
+    sequentially in one process.
+    """
+    assert d.defs.resolve_job_def("reddit_refresh").executor_def == dg.in_process_executor
+
+
 def test_the_python_and_dbt_steps_carry_a_retry_policy() -> None:
     # A transient Reddit, warehouse or dbt failure should not need a manual re-run; the
     # policy now lives on the assets instead of the Prefect task decorators. Dagster

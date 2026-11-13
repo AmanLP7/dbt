@@ -229,7 +229,9 @@ Posts are **one asset per subreddit** — `reddit_raw/r_posts/<name>`, generated
 step: each can be materialised alone, retried alone, and a subreddit that is private,
 banned or rate-limited fails alone. Each calls `extract_posts_for(name, sqlite.connection)`
 and shares one SQLite connection per run (the `RedditSqlite` resource — one fresh
-`data/reddit.db` per run). `reddit_raw/r_posts` stays as the barrier they
+`data/reddit.db` per run). Because that file has a single writer, `reddit_refresh`
+pins `in_process_executor` so the loads run sequentially in one process rather than
+fanning out across workers. `reddit_raw/r_posts` stays as the barrier they
 all feed: it lands the dumped posts into `workspace.topic_raw.r_posts` via `COPY INTO`
 once every per-subreddit load has succeeded; `extract_posts()` remains the
 whole-seed path for `python -m ingestion.reddit.extract_reddit`. Each

@@ -195,9 +195,12 @@ class RedditSqlite(dg.ConfigurableResource):
     into this one, the three tables are created once, and the connection is closed
     when the run ends.
 
-    A multiprocess executor gives each worker process its own resource instance, so
-    this stays one connection per process rather than one shared across processes.
-    The default executor is in-process, so every load shares this one connection.
+    SQLite is a single-writer file, so the dump is only correct when every load runs
+    sequentially in one process: `reddit_refresh` pins `in_process_executor` for
+    exactly that reason. Under the default multiprocess executor each worker would
+    get its own resource instance and its own `reset=True`, so the 66 concurrent
+    loads would unlink and recreate the same file under each other and fail with
+    `attempt to write a readonly database`.
     """
 
     _connection: Any = PrivateAttr(default=None)
@@ -321,6 +324,12 @@ def dbt_reddit(context: dg.AssetExecutionContext, dbt: DbtCliResource):
 reddit_refresh = dg.define_asset_job(
     name="reddit_refresh",
     selection=dg.AssetSelection.all(),
+    # The raw loads share one SQLite dump file, and SQLite has a single writer, so
+    # the per-subreddit assets must not fan out across worker processes: each worker
+    # would open its own `RedditSqlite` and `reset=True` the file under the others.
+    # The default multiprocess executor does exactly that, so the job pins the
+    # in-process executor and every write happens sequentially in one process.
+    executor_def=dg.in_process_executor,
     description="Land the posts, comments and users, then rebuild and test the models.",
 )
 
